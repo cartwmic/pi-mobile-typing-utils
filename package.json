@@ -28,7 +28,7 @@
   "homepage": "https://github.com/cartwmic/pi-mobile-typing-utils#readme",
   "pi": {
     "extensions": [
-      "./dist/index.js"
+      "./index.ts"
     ]
   },
   "scripts": {
