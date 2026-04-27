@@ -369,21 +369,83 @@ describe("createTyposCommand", () => {
       config: createConfig(),
     });
 
-    expect(command.getArgumentCompletions("")?.map((item) => item.value)).toEqual(["on", "off", "dict", "default"]);
+    // Top-level completions: value === label, since Pi replaces the whole
+    // argument text and the parent is the slash command itself.
+    expect(command.getArgumentCompletions("")).toEqual([
+      { label: "on", value: "on" },
+      { label: "off", value: "off" },
+      { label: "dict", value: "dict" },
+      { label: "default", value: "default" },
+    ]);
     expect(command.getArgumentCompletions("o")?.map((item) => item.value)).toEqual(["on", "off"]);
     expect(command.getArgumentCompletions("d")?.map((item) => item.value)).toEqual(["dict", "default"]);
     expect(command.getArgumentCompletions("di")?.map((item) => item.value)).toEqual(["dict"]);
     expect(command.getArgumentCompletions("def")?.map((item) => item.value)).toEqual(["default"]);
-    expect(command.getArgumentCompletions("dict ")?.map((item) => item.value)).toEqual([
-      "add",
-      "remove",
-      "search",
-      "clear",
+
+    // Second-level completions: label is the leaf token, but value must
+    // include the parent so applyCompletion (which replaces the whole
+    // argument text) doesn't drop the `dict` / `default` word.
+    expect(command.getArgumentCompletions("dict ")).toEqual([
+      { label: "add", value: "dict add" },
+      { label: "remove", value: "dict remove" },
+      { label: "search", value: "dict search" },
+      { label: "clear", value: "dict clear" },
     ]);
-    expect(command.getArgumentCompletions("dict s")?.map((item) => item.value)).toEqual(["search"]);
-    expect(command.getArgumentCompletions("default ")?.map((item) => item.value)).toEqual(["on", "off"]);
-    expect(command.getArgumentCompletions("default o")?.map((item) => item.value)).toEqual(["on", "off"]);
-    expect(command.getArgumentCompletions("default of")?.map((item) => item.value)).toEqual(["off"]);
+    expect(command.getArgumentCompletions("dict s")).toEqual([
+      { label: "search", value: "dict search" },
+    ]);
+    expect(command.getArgumentCompletions("default ")).toEqual([
+      { label: "on", value: "default on" },
+      { label: "off", value: "default off" },
+    ]);
+    expect(command.getArgumentCompletions("default o")).toEqual([
+      { label: "on", value: "default on" },
+      { label: "off", value: "default off" },
+    ]);
+    expect(command.getArgumentCompletions("default of")).toEqual([
+      { label: "off", value: "default off" },
+    ]);
+  });
+
+  test("second-level completion values produce correct lines under Pi's applyCompletion", async () => {
+    // Regression test for the autocomplete bug where selecting a second-level
+    // completion (e.g. `on` from `/typos default `) dropped the parent token.
+    // Pi's CombinedAutocompleteProvider.applyCompletion replaces the entire
+    // argument text (everything after `/typos `) with the chosen item.value,
+    // so item.value must include the parent token.
+    const dictionary = await createDictionary();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
+    });
+
+    const simulateApply = (line: string, completionValue: string): string => {
+      // Mirror the substring math in pi-tui's applyCompletion: prefix is the
+      // argumentText returned from getSuggestions (everything after the
+      // first space following the slash command name), and beforePrefix is
+      // the text up to but not including that argumentText.
+      const cursorCol = line.length;
+      const spaceIndex = line.indexOf(" ");
+      const argumentText = line.slice(spaceIndex + 1);
+      const beforePrefix = line.slice(0, cursorCol - argumentText.length);
+      return beforePrefix + completionValue;
+    };
+
+    // /typos default <empty> → selecting "on" must yield "/typos default on".
+    const defaultOn = command.getArgumentCompletions("default ")?.[0];
+    expect(defaultOn).toBeDefined();
+    expect(simulateApply("/typos default ", defaultOn!.value)).toBe("/typos default on");
+
+    // /typos default of → selecting "off" must yield "/typos default off".
+    const defaultOff = command.getArgumentCompletions("default of")?.[0];
+    expect(defaultOff).toBeDefined();
+    expect(simulateApply("/typos default of", defaultOff!.value)).toBe("/typos default off");
+
+    // Same regression for /typos dict subcommands.
+    const dictAdd = command.getArgumentCompletions("dict a")?.[0];
+    expect(dictAdd).toBeDefined();
+    expect(simulateApply("/typos dict a", dictAdd!.value)).toBe("/typos dict add");
   });
 
   test("/typos default reports the current default mode", async () => {

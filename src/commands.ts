@@ -121,7 +121,7 @@ export function createTyposCommand({
       if (dictPrefix.includes(" ")) {
         return null;
       }
-      return buildCompletions(DICTIONARY_SUBCOMMANDS, dictPrefix);
+      return buildSubcommandCompletions("dict", DICTIONARY_SUBCOMMANDS, dictPrefix);
     }
 
     if (prefix.startsWith("default ")) {
@@ -129,7 +129,7 @@ export function createTyposCommand({
       if (defaultPrefix.includes(" ")) {
         return null;
       }
-      return buildCompletions(DEFAULT_SUBCOMMANDS, defaultPrefix);
+      return buildSubcommandCompletions("default", DEFAULT_SUBCOMMANDS, defaultPrefix);
     }
 
     return null;
@@ -487,6 +487,32 @@ function buildCompletions(values: readonly string[], prefix: string): Autocomple
     .map((value) => ({
       label: value,
       value,
+    }));
+
+  return matches.length > 0 ? matches : null;
+}
+
+/**
+ * Build completion items for a second-level subcommand (e.g. `dict add`,
+ * `default on`).
+ *
+ * Pi's `applyCompletion` replaces the entire argument text (everything after
+ * `/<command> `) with the chosen item's `value`. That means a second-level
+ * completion can't return just the leaf token — selecting `"on"` from a
+ * `/typos default ` dropdown would otherwise rewrite the line to `/typos on`,
+ * dropping the `default` parent. So `value` must include the parent token,
+ * while `label` stays the leaf token for a clean dropdown UI.
+ */
+function buildSubcommandCompletions(
+  parent: string,
+  values: readonly string[],
+  prefix: string,
+): AutocompleteItem[] | null {
+  const matches = values
+    .filter((value) => value.startsWith(prefix))
+    .map((value) => ({
+      label: value,
+      value: `${parent} ${value}`,
     }));
 
   return matches.length > 0 ? matches : null;
