@@ -66,7 +66,7 @@ export function createTyposCommand({
     }
 
     if (trimmedArgs === "dict") {
-      showDictionary(ctx, learnedDictionary.getAll());
+      showBareDict(ctx, learnedDictionary);
       return;
     }
 
@@ -211,7 +211,7 @@ export function createTyposCommand({
     const trimmedArgs = rawArgs.trim();
 
     if (trimmedArgs.length === 0) {
-      showDictionary(ctx, learnedDictionary.getAll());
+      showBareDict(ctx, learnedDictionary);
       return;
     }
 
@@ -227,6 +227,9 @@ export function createTyposCommand({
         }
 
         const matches = learnedDictionary.search(remainder);
+        const pendingMatchCount = learnedDictionary
+          .getPending()
+          .filter(({ word }) => word.includes(remainder.toLowerCase())).length;
 
         if (matches.length === 0) {
           ctx.ui.notify(`No matches for "${remainder}"`, "info");
@@ -236,6 +239,7 @@ export function createTyposCommand({
         showDictionary(ctx, matches, {
           totalLabel: "matches",
           truncatedNote: `Showing ${MAX_DICTIONARY_RESULTS} of ${matches.length} matches`,
+          pendingMatchCount,
         });
         return;
       }
@@ -303,7 +307,7 @@ export function createTyposCommand({
   function showDictionary(
     ctx: ExtensionCommandContext,
     entries: ReturnType<LearnedDictionary["getAll"]>,
-    options?: { totalLabel: "words" | "matches"; truncatedNote?: string },
+    options?: { totalLabel: "words" | "matches"; truncatedNote?: string; pendingMatchCount?: number },
   ): void {
     if (entries.length === 0) {
       ctx.ui.notify(EMPTY_DICTIONARY_MESSAGE, "info");
@@ -323,7 +327,47 @@ export function createTyposCommand({
       message = `${message}\n\n${note}`;
     }
 
+    const pendingCount = options?.pendingMatchCount ?? 0;
+    if (pendingCount > 0) {
+      const plural = pendingCount === 1 ? "match" : "matches";
+      message = `${message}\n\n(Plus ${pendingCount} pending ${plural} — see /typos dict)`;
+    }
+
     ctx.ui.notify(message, "info");
+  }
+
+  function showBareDict(ctx: ExtensionCommandContext, dictionary: LearnedDictionary): void {
+    const graduated = dictionary.getAll();
+    const pending = dictionary.getPending();
+
+    if (graduated.length === 0 && pending.length === 0) {
+      ctx.ui.notify(EMPTY_DICTIONARY_MESSAGE, "info");
+      return;
+    }
+
+    const parts: string[] = [];
+
+    if (graduated.length > 0) {
+      const limitedGraduated = graduated.slice(0, MAX_DICTIONARY_RESULTS);
+      const lines = limitedGraduated.map(({ word, entry }) => `${word}  ${entry.added}  (${entry.source})`);
+      let section = lines.join("\n");
+
+      if (graduated.length > MAX_DICTIONARY_RESULTS) {
+        const note = `Showing ${MAX_DICTIONARY_RESULTS} of ${graduated.length} words — use \`/typos dict search <term>\` to filter`;
+        section = `${section}\n\n${note}`;
+      }
+
+      parts.push(section);
+    }
+
+    if (pending.length > 0) {
+      const limitedPending = pending.slice(0, MAX_DICTIONARY_RESULTS);
+      const pendingLines = limitedPending.map(({ word, rejections }) => `${word}  (${rejections} of 2 rejections)`);
+      const pendingSection = `Pending (1 more rejection to learn):\n${pendingLines.join("\n")}`;
+      parts.push(pendingSection);
+    }
+
+    ctx.ui.notify(parts.join("\n\n"), "info");
   }
 
   return {

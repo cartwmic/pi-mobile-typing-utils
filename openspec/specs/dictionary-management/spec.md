@@ -143,3 +143,15 @@ The `/typos dict` command SHALL handle invalid subcommands and missing arguments
 #### Scenario: Missing word argument
 - **WHEN** the user runs `/typos dict add` with no word
 - **THEN** the extension SHALL show "Usage: /typos dict add <word>"
+
+### Requirement: Pending rejections are visible in dictionary listing
+
+Words that have received at least one correction rejection but have not yet reached the auto-learn threshold (2 rejections) are tracked as "pending". The `/typos dict` command (bare, no subcommand) SHALL display these pending entries in a dedicated section below the graduated words so users can see which words are on the path to being learned. The `/typos dict search <term>` command searches only graduated entries, but SHALL append a note indicating how many pending entries also match the search term.
+
+#### Scenario: Pending entries shown alongside graduated entries
+- **WHEN** the user runs `/typos dict` and there are both graduated and pending entries
+- **THEN** the output SHALL first list graduated words (in the standard format: `word  ISO-date  (source)`) followed by a blank line, then a `Pending (1 more rejection to learn):` header, followed by each pending word in the format `word  (N of 2 rejections)`, sorted by rejection count descending then alphabetically
+
+#### Scenario: Search shows hint when matching pending entries exist
+- **WHEN** the user runs `/typos dict search <term>` and there are graduated matches AND pending entries that contain the search term
+- **THEN** the search results SHALL show only the graduated matches (existing behavior), with an additional note appended: `(Plus N pending matches — see /typos dict)` where N is the count of pending entries matching the term

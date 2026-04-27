@@ -201,6 +201,40 @@ describe("LearnedDictionary", () => {
     }
   });
 
+  test("getPending returns empty array when no pending rejections exist", () => {
+    const dictionary = createDictionary();
+    expect(dictionary.getPending()).toEqual([]);
+  });
+
+  test("getPending sorts by rejection count descending then alphabetically", () => {
+    const dictionary = createDictionary();
+    vi.spyOn(dictionary, "save").mockResolvedValue();
+
+    // Both words get 1 rejection (threshold=2 so they stay pending).
+    // Same count → alphabetical tiebreaker: "beta" > "alpha".
+    dictionary.recordRejection("beta");
+    dictionary.recordRejection("alpha");
+
+    expect(dictionary.getPending()).toEqual([
+      { word: "alpha", rejections: 1 },
+      { word: "beta", rejections: 1 },
+    ]);
+  });
+
+  test("getPending only returns entries with rejection count below the threshold", () => {
+    const dictionary = createDictionary();
+    vi.spyOn(dictionary, "save").mockResolvedValue();
+
+    // First rejection: stays pending (count 1 < threshold 2).
+    dictionary.recordRejection("alpha");
+    expect(dictionary.getPending()).toEqual([{ word: "alpha", rejections: 1 }]);
+
+    // Second rejection: graduates to learned dict, removed from pending.
+    dictionary.recordRejection("alpha");
+    expect(dictionary.getPending()).toEqual([]);
+    expect(dictionary.has("alpha")).toBe(true);
+  });
+
   test("creates missing parent directories on first save", async () => {
     const nestedFilePath = join(tempDir, "missing", "nested", "dictionary.json");
     const dictionary = createDictionary(nestedFilePath);

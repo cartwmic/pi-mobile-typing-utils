@@ -224,6 +224,42 @@ describe("createTyposCommand", () => {
     expect(note).toBe("Showing 50 of 55 matches");
   });
 
+  test("/typos dict shows graduated and pending sections together", async () => {
+    vi.useFakeTimers();
+
+    const dictionary = await createDictionary();
+    vi.spyOn(dictionary, "save").mockResolvedValue();
+
+    const start = Date.parse("2024-01-01T00:00:00.000Z");
+    vi.setSystemTime(new Date(start));
+    dictionary.add("omega", "manual");    // graduated entry
+
+    // Pending entries (1 rejection each — threshold is 2, so they stay pending).
+    dictionary.recordRejection("nicee");
+    dictionary.recordRejection("ths");
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("dict", ctx);
+
+    const message = ctx.notifications.at(-1)?.message ?? "";
+    const [graduatedSection, pendingSection] = message.split("\n\n");
+
+    // Graduated section uses the standard word/date/source format.
+    expect(graduatedSection).toBe("omega  2024-01-01T00:00:00.000Z  (manual)");
+
+    // Pending section header and per-word lines.
+    expect(pendingSection).toContain("Pending (1 more rejection to learn):");
+    // Alphabetical order (both have count=1).
+    expect(pendingSection).toContain("nicee  (1 of 2 rejections)");
+    expect(pendingSection).toContain("ths  (1 of 2 rejections)");
+    expect(pendingSection.indexOf("nicee")).toBeLessThan(pendingSection.indexOf("ths"));
+  });
+
   test("shows the empty dictionary message for /typos dict", async () => {
     const dictionary = await createDictionary();
     const command = createTyposCommand({

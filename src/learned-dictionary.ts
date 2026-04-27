@@ -135,6 +135,18 @@ export class LearnedDictionary {
     return this.getSortedEntries();
   }
 
+  getPending(): Array<{ word: string; rejections: number }> {
+    return [...this.pendingRejections.entries()]
+      .map(([word, rejections]) => ({ word, rejections }))
+      .sort((a, b) => {
+        if (b.rejections !== a.rejections) {
+          return b.rejections - a.rejections;
+        }
+
+        return a.word.localeCompare(b.word);
+      });
+  }
+
   get size(): number {
     return this.words.size;
   }
