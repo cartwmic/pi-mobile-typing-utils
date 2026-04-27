@@ -55,7 +55,14 @@ export class LearnedDictionary {
       this.words = new Map();
       this.pendingRejections = new Map();
 
-      if (isMissingFileError(error) || error instanceof SyntaxError || error instanceof InvalidDictionaryError) {
+      // Missing file on first run is the expected initial state, not an error.
+      // Per spec (Scenario: Dictionary file does not exist) we start with an empty
+      // dictionary and create the file on first write — silently.
+      if (isMissingFileError(error)) {
+        return;
+      }
+
+      if (error instanceof SyntaxError || error instanceof InvalidDictionaryError) {
         console.warn(`Failed to load learned dictionary from ${this.filePath}: ${formatError(error)}`);
         return;
       }

@@ -185,6 +185,22 @@ describe("LearnedDictionary", () => {
     expect(dictionary.has("termux")).toBe(false);
   });
 
+  test("loads silently when dictionary file does not exist (first run)", async () => {
+    // Per spec (dictionary-management): missing file on startup is the expected
+    // initial state. The extension SHALL start with an empty dictionary and
+    // SHALL NOT log a warning.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const dictionary = createDictionary();
+      await expect(dictionary.load()).resolves.toBeUndefined();
+      expect(dictionary.size).toBe(0);
+      expect(dictionary.getAll()).toEqual([]);
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   test("creates missing parent directories on first save", async () => {
     const nestedFilePath = join(tempDir, "missing", "nested", "dictionary.json");
     const dictionary = createDictionary(nestedFilePath);
