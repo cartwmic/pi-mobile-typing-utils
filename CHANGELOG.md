@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/) and this 
 ### Added
 
 - `/typos default [on|off]` subcommand and persistent extension configuration (`~/.pi/agent/mobile-autocorrect-config.json`, override with `MOBILE_AUTOCORRECT_CONFIG_PATH`) to control the autocorrect mode new sessions start in. The bootstrap value is `off`, preserving prior per-session behavior; setting it to `on` reconciles every `session_start` event to enabled. Reconciliation is bidirectional and silent when state already matches.
+- `/typos config [defaultMode|maxEditDistance|minWordLength] [<value>]` flat key/value tuning surface, persisted to the same config file. `maxEditDistance` (integer `1`–`3`, default `2`) is baked into the SymSpell index at engine build time — changing it drops the cached engine and, when autocorrect is currently enabled, hot-reloads it. `minWordLength` (integer `2`–`8`, default `2`) is read live by the correction engine on every lookup, no rebuild required. Both values are range-validated; out-of-range or non-integer inputs are rejected without modifying the persisted config. Out-of-range *persisted* values fall back to the bootstrap default for that key on load.
 
 ## [0.1.0] - 2026-04-26
 

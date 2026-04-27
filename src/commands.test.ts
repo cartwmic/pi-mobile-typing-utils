@@ -355,7 +355,10 @@ describe("createTyposCommand", () => {
     await command.handler("dict search", ctx);
 
     expect(ctx.notifications).toEqual([
-      { message: "Unknown command. Usage: /typos [on|off|dict ...|default ...]", level: "warning" },
+      {
+        message: "Unknown command. Usage: /typos [on|off|dict ...|default ...|config ...]",
+        level: "warning",
+      },
       { message: "Usage: /typos dict [search <term>|add <word>|remove <word>|clear]", level: "warning" },
       { message: "Usage: /typos dict search <term>", level: "warning" },
     ]);
@@ -376,6 +379,7 @@ describe("createTyposCommand", () => {
       { label: "off", value: "off" },
       { label: "dict", value: "dict" },
       { label: "default", value: "default" },
+      { label: "config", value: "config" },
     ]);
     expect(command.getArgumentCompletions("o")?.map((item) => item.value)).toEqual(["on", "off"]);
     expect(command.getArgumentCompletions("d")?.map((item) => item.value)).toEqual(["dict", "default"]);
@@ -593,6 +597,254 @@ describe("createTyposCommand", () => {
 
     expect(command.state.enabled).toBe(false);
     expect(ctx.notifications.at(-1)).toEqual({ message: "Autocorrect OFF", level: "info" });
+  });
+
+  test("/typos config lists all configured values", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("config", ctx);
+
+    const message = ctx.notifications.at(-1)?.message ?? "";
+    expect(message.startsWith("Mobile autocorrect config:")).toBe(true);
+    expect(message).toMatch(/defaultMode\s+off/);
+    expect(message).toMatch(/maxEditDistance\s+2\s+\(range 1-3\)/);
+    expect(message).toMatch(/minWordLength\s+2\s+\(range 2-8\)/);
+  });
+
+  test("/typos config <key> shows a single value", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("config maxEditDistance", ctx);
+
+    expect(ctx.notifications.at(-1)).toEqual({
+      message: "maxEditDistance = 2 (range 1-3)",
+      level: "info",
+    });
+  });
+
+  test("/typos config rejects unknown keys", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("config wibble 5", ctx);
+
+    expect(ctx.notifications.at(-1)).toEqual({
+      message: "Usage: /typos config [defaultMode|maxEditDistance|minWordLength] [<value>]",
+      level: "warning",
+    });
+  });
+
+  test("/typos config defaultMode delegates to the same path as /typos default", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("config defaultMode on", ctx);
+
+    expect(config.getDefaultMode()).toBe("on");
+    expect(ctx.notifications.at(-1)).toEqual({
+      message: "Default mode for new sessions set to on",
+      level: "info",
+    });
+  });
+
+  test("/typos config maxEditDistance validates the integer range", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("config maxEditDistance 0", ctx);
+    await command.handler("config maxEditDistance 4", ctx);
+    await command.handler("config maxEditDistance two", ctx);
+    await command.handler("config maxEditDistance 1.5", ctx);
+
+    expect(config.getMaxEditDistance()).toBe(2); // unchanged
+    expect(ctx.notifications.map((n) => n.message)).toEqual([
+      "Usage: /typos config maxEditDistance <integer 1-3>",
+      "Usage: /typos config maxEditDistance <integer 1-3>",
+      "Usage: /typos config maxEditDistance <integer 1-3>",
+      "Usage: /typos config maxEditDistance <integer 1-3>",
+    ]);
+  });
+
+  test("/typos config maxEditDistance persists and rebuilds the engine when not enabled", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const initialize = vi.fn(async () => undefined);
+    const createCorrectionEngine = vi.fn(() => ({ initialize } as never));
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+      createCorrectionEngine,
+      createAutocorrectEditor: (() => ({}) as never) as never,
+    });
+    const ctx = createCommandContext();
+
+    // Bring the engine into existence once.
+    await command.handler("on", ctx);
+    await command.handler("off", ctx);
+    expect(createCorrectionEngine).toHaveBeenCalledTimes(1);
+
+    await command.handler("config maxEditDistance 3", ctx);
+
+    expect(config.getMaxEditDistance()).toBe(3);
+    expect(ctx.notifications.at(-1)).toEqual({ message: "maxEditDistance set to 3", level: "info" });
+
+    // Next enable must rebuild the engine with the new value.
+    await command.handler("on", ctx);
+    expect(createCorrectionEngine).toHaveBeenCalledTimes(2);
+    expect(createCorrectionEngine.mock.calls[1][0].maxEditDistance).toBe(3);
+  });
+
+  test("/typos config maxEditDistance hot-reloads when autocorrect is currently on", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const initialize = vi.fn(async () => undefined);
+    const createCorrectionEngine = vi.fn(() => ({ initialize } as never));
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+      createCorrectionEngine,
+      createAutocorrectEditor: (() => ({}) as never) as never,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("on", ctx);
+    expect(command.state.enabled).toBe(true);
+    expect(createCorrectionEngine).toHaveBeenCalledTimes(1);
+    expect(createCorrectionEngine.mock.calls[0][0].maxEditDistance).toBe(2);
+
+    await command.handler("config maxEditDistance 3", ctx);
+
+    expect(command.state.enabled).toBe(true); // back on after the hot-reload
+    expect(createCorrectionEngine).toHaveBeenCalledTimes(2);
+    expect(createCorrectionEngine.mock.calls[1][0].maxEditDistance).toBe(3);
+  });
+
+  test("/typos config minWordLength persists and is read live without an engine rebuild", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const initialize = vi.fn(async () => undefined);
+    const createCorrectionEngine = vi.fn((opts: { getMinWordLength?: () => number }) => ({
+      initialize,
+      getMinWordLengthRef: opts.getMinWordLength,
+    }) as never);
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+      createCorrectionEngine,
+      createAutocorrectEditor: (() => ({}) as never) as never,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("on", ctx);
+    const accessor = (command.state.engine as unknown as { getMinWordLengthRef?: () => number })
+      .getMinWordLengthRef;
+    expect(accessor).toBeTypeOf("function");
+    expect(accessor!()).toBe(2);
+
+    await command.handler("config minWordLength 4", ctx);
+
+    expect(config.getMinWordLength()).toBe(4);
+    expect(ctx.notifications.at(-1)).toEqual({ message: "minWordLength set to 4", level: "info" });
+    // Same engine instance — no rebuild.
+    expect(createCorrectionEngine).toHaveBeenCalledTimes(1);
+    // The live accessor reflects the new value immediately.
+    expect(accessor!()).toBe(4);
+  });
+
+  test("/typos config minWordLength validates the integer range", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("config minWordLength 1", ctx);
+    await command.handler("config minWordLength 9", ctx);
+
+    expect(config.getMinWordLength()).toBe(2); // unchanged
+    expect(ctx.notifications.map((n) => n.message)).toEqual([
+      "Usage: /typos config minWordLength <integer 2-8>",
+      "Usage: /typos config minWordLength <integer 2-8>",
+    ]);
+  });
+
+  test("/typos config completion produces correct lines under Pi's applyCompletion", async () => {
+    // Same regression check as second-level completions: value must include
+    // the full argument path so applyCompletion (which replaces the entire
+    // argument text) doesn't drop tokens.
+    const dictionary = await createDictionary();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
+    });
+
+    const simulateApply = (line: string, completionValue: string): string => {
+      const cursorCol = line.length;
+      const spaceIndex = line.indexOf(" ");
+      const argumentText = line.slice(spaceIndex + 1);
+      const beforePrefix = line.slice(0, cursorCol - argumentText.length);
+      return beforePrefix + completionValue;
+    };
+
+    // /typos config <empty> → selecting "maxEditDistance" yields full path.
+    const keyItem = command
+      .getArgumentCompletions("config ")
+      ?.find((item) => item.label === "maxEditDistance");
+    expect(keyItem).toBeDefined();
+    expect(simulateApply("/typos config ", keyItem!.value)).toBe("/typos config maxEditDistance");
+
+    // /typos config maxEditDistance <empty> → selecting "3" yields full path.
+    const valueItem = command
+      .getArgumentCompletions("config maxEditDistance ")
+      ?.find((item) => item.label === "3");
+    expect(valueItem).toBeDefined();
+    expect(simulateApply("/typos config maxEditDistance ", valueItem!.value)).toBe(
+      "/typos config maxEditDistance 3",
+    );
+
+    // Partial filter on the value position.
+    const partialItems = command.getArgumentCompletions("config minWordLength 3");
+    expect(partialItems?.map((item) => item.label)).toEqual(["3"]);
+    expect(partialItems?.[0]?.value).toBe("config minWordLength 3");
   });
 
   async function createDictionary(): Promise<LearnedDictionary> {

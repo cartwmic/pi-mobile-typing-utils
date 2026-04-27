@@ -76,4 +76,62 @@ describe("Config", () => {
 
     expect(config.getDefaultMode()).toBe("off");
   });
+
+  test("returns the bootstrap defaults for the tuning fields", async () => {
+    const config = new Config({ filePath: join(tempDir, "config.json") });
+    await config.load();
+
+    expect(config.getMaxEditDistance()).toBe(2);
+    expect(config.getMinWordLength()).toBe(2);
+  });
+
+  test("setMaxEditDistance persists in-range integers and rejects everything else", async () => {
+    const filePath = join(tempDir, "config.json");
+    const config = new Config({ filePath });
+    await config.load();
+
+    await config.setMaxEditDistance(3);
+    expect(config.getMaxEditDistance()).toBe(3);
+
+    await expect(config.setMaxEditDistance(0)).rejects.toBeInstanceOf(RangeError);
+    await expect(config.setMaxEditDistance(4)).rejects.toBeInstanceOf(RangeError);
+    await expect(config.setMaxEditDistance(1.5)).rejects.toBeInstanceOf(RangeError);
+
+    const reloaded = new Config({ filePath });
+    await reloaded.load();
+    expect(reloaded.getMaxEditDistance()).toBe(3);
+  });
+
+  test("setMinWordLength persists in-range integers and rejects everything else", async () => {
+    const filePath = join(tempDir, "config.json");
+    const config = new Config({ filePath });
+    await config.load();
+
+    await config.setMinWordLength(5);
+    expect(config.getMinWordLength()).toBe(5);
+
+    await expect(config.setMinWordLength(1)).rejects.toBeInstanceOf(RangeError);
+    await expect(config.setMinWordLength(9)).rejects.toBeInstanceOf(RangeError);
+    await expect(config.setMinWordLength(2.5)).rejects.toBeInstanceOf(RangeError);
+
+    const reloaded = new Config({ filePath });
+    await reloaded.load();
+    expect(reloaded.getMinWordLength()).toBe(5);
+  });
+
+  test("out-of-range persisted values fall back to the bootstrap defaults", async () => {
+    const filePath = join(tempDir, "config.json");
+    await writeFile(
+      filePath,
+      JSON.stringify({ version: 1, defaultMode: "on", maxEditDistance: 99, minWordLength: 0 }),
+      "utf8",
+    );
+
+    const config = new Config({ filePath });
+    await config.load();
+
+    expect(config.getDefaultMode()).toBe("on"); // valid — preserved
+    expect(config.getMaxEditDistance()).toBe(2); // out of range — default
+    expect(config.getMinWordLength()).toBe(2); // out of range — default
+  });
 });

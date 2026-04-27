@@ -7,6 +7,7 @@ import type { ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { FakeCustomEditor, fakeMatchesKey, typeText } from "../test/fake-custom-editor.js";
+import { Config } from "./config.js";
 import { LearnedDictionary } from "./learned-dictionary.js";
 
 vi.mock("@mariozechner/pi-coding-agent", () => ({
@@ -74,6 +75,7 @@ describe("toggle lifecycle integration", () => {
     const command = createTyposCommand({
       learnedDictionary,
       techDictPath: "/tmp/tech-dict.txt",
+      config: new Config({ filePath: join(tempDir, `config-${randomUUID()}.json`) }),
       createCorrectionEngine: () => ({ initialize, shouldCorrect } as never),
     });
     const ctx = createCommandContext();

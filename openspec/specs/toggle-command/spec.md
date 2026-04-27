@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The `/typos` command is the user-facing control surface for autocorrect. It supports `on`, `off`, bare-toggle, status reporting, idempotent re-issue, lazy engine initialization with status feedback, async-init serialization (final state wins), routes `dict` subcommands to dictionary management, and routes `default` subcommands to per-extension configuration of the default mode for new sessions. Autocorrect state is per-session — each new Pi session starts in the configured default mode (which itself defaults to disabled if never set), regardless of the prior session's state.
+The `/typos` command is the user-facing control surface for autocorrect. It supports `on`, `off`, bare-toggle, status reporting, idempotent re-issue, lazy engine initialization with status feedback, async-init serialization (final state wins), routes `dict` subcommands to dictionary management, routes `default` subcommands to the persisted default mode for new sessions, and routes `config` subcommands to a flat key/value tuning surface (`defaultMode`, `maxEditDistance`, `minWordLength`). Autocorrect state is per-session — each new Pi session starts in the configured default mode (which itself defaults to disabled if never set), regardless of the prior session's state.
 
 ## Requirements
 
@@ -119,11 +119,11 @@ The `/typos` command SHALL route arguments starting with "dict" to the dictionar
 - **THEN** the word SHALL be added to the learned dictionary (dictionary management is always available)
 
 ### Requirement: Argument auto-completion for /typos command
-The `/typos` command SHALL provide argument completions via `getArgumentCompletions`. First-level completions SHALL include `on`, `off`, `dict`, `default`. When the first argument is `dict`, second-level completions SHALL include `add`, `remove`, `search`, `clear`. When the first argument is `default`, second-level completions SHALL include `on`, `off`.
+The `/typos` command SHALL provide argument completions via `getArgumentCompletions`. First-level completions SHALL include `on`, `off`, `dict`, `default`, `config`. When the first argument is `dict`, second-level completions SHALL include `add`, `remove`, `search`, `clear`. When the first argument is `default`, second-level completions SHALL include `on`, `off`. When the first argument is `config`, second-level completions SHALL include `defaultMode`, `maxEditDistance`, `minWordLength`, and third-level completions SHALL include the valid values for the chosen key. Second-level and deeper completion items SHALL set their `value` to the full argument path (parent token included), because Pi's `applyCompletion` replaces the entire argument text with the chosen item's `value`.
 
 #### Scenario: First-level completion
 - **WHEN** the user types `/typos ` and triggers completion
-- **THEN** the extension SHALL suggest `on`, `off`, `dict`, `default`
+- **THEN** the extension SHALL suggest `on`, `off`, `dict`, `default`, `config`
 
 #### Scenario: Second-level dict completion
 - **WHEN** the user types `/typos dict ` and triggers completion
@@ -132,3 +132,50 @@ The `/typos` command SHALL provide argument completions via `getArgumentCompleti
 #### Scenario: Second-level default completion
 - **WHEN** the user types `/typos default ` and triggers completion
 - **THEN** the extension SHALL suggest `on`, `off`
+
+### Requirement: Tuning configuration via /typos config
+The extension SHALL expose a flat `/typos config` key/value surface for runtime-tunable parameters, persisted to the same configuration file as `defaultMode`. The supported keys SHALL be `defaultMode`, `maxEditDistance`, and `minWordLength`. Each key SHALL be range-validated; out-of-range or non-integer values SHALL be rejected without modifying the persisted configuration. The `defaultMode` key SHALL be functionally equivalent to the dedicated `/typos default` subcommand. The `maxEditDistance` value SHALL be an integer in `[1, 3]` and SHALL be applied by rebuilding the SymSpell index (the value is baked into the index at initialization time); when autocorrect is currently enabled the rebuild SHALL happen automatically (disable, drop the cached engine, re-enable). The `minWordLength` value SHALL be an integer in `[2, 8]` and SHALL be applied live (read by the correction engine on each lookup, no rebuild required).
+
+#### Scenario: List all configured values
+- **WHEN** the user runs `/typos config`
+- **THEN** the extension SHALL show a single info notification beginning with "Mobile autocorrect config:" and including one line per key with the current value and (for ranged keys) the allowed range
+
+#### Scenario: Show a single configured value
+- **WHEN** the user runs `/typos config maxEditDistance`
+- **THEN** the extension SHALL show "maxEditDistance = <value> (range 1-3)"; analogous behavior applies to `minWordLength` (range 2-8) and `defaultMode` (no range)
+
+#### Scenario: Reject unknown config keys
+- **WHEN** the user runs `/typos config <key>` where `<key>` is not one of `defaultMode`, `maxEditDistance`, `minWordLength`
+- **THEN** the extension SHALL show "Usage: /typos config [defaultMode|maxEditDistance|minWordLength] [<value>]" and SHALL NOT modify the configuration
+
+#### Scenario: Configure defaultMode via /typos config
+- **WHEN** the user runs `/typos config defaultMode on` and the previous configured value is `off`
+- **THEN** the extension SHALL behave identically to `/typos default on`: persist the value and emit "Default mode for new sessions set to on"
+
+#### Scenario: Configure maxEditDistance with engine rebuild
+- **WHEN** the user runs `/typos config maxEditDistance <n>` where `<n>` is an integer in `[1, 3]` and differs from the current value
+- **THEN** the configuration SHALL be persisted, the cached correction engine SHALL be dropped, and the next `/typos on` (or the immediate hot-reload if autocorrect is currently enabled) SHALL build a new SymSpell index with the new value; a notification SHALL show "maxEditDistance set to <n>"
+
+#### Scenario: Hot-reload the engine when maxEditDistance changes while enabled
+- **WHEN** the user runs `/typos config maxEditDistance <n>` while autocorrect is currently enabled
+- **THEN** the extension SHALL disable autocorrect, drop the cached engine, and re-enable autocorrect (rebuilding the engine with the new value), so the change takes effect without requiring a manual `/typos off; /typos on`
+
+#### Scenario: Reject out-of-range or non-integer maxEditDistance
+- **WHEN** the user runs `/typos config maxEditDistance <v>` where `<v>` is not an integer in `[1, 3]`
+- **THEN** the extension SHALL show "Usage: /typos config maxEditDistance <integer 1-3>" and SHALL NOT modify the configuration or rebuild the engine
+
+#### Scenario: Configure minWordLength live
+- **WHEN** the user runs `/typos config minWordLength <n>` where `<n>` is an integer in `[2, 8]` and differs from the current value
+- **THEN** the configuration SHALL be persisted and the next correction lookup SHALL use the new value without rebuilding the engine; a notification SHALL show "minWordLength set to <n>"
+
+#### Scenario: Reject out-of-range or non-integer minWordLength
+- **WHEN** the user runs `/typos config minWordLength <v>` where `<v>` is not an integer in `[2, 8]`
+- **THEN** the extension SHALL show "Usage: /typos config minWordLength <integer 2-8>" and SHALL NOT modify the configuration
+
+#### Scenario: Out-of-range persisted values fall back to defaults
+- **WHEN** the configuration file contains a value for `maxEditDistance` or `minWordLength` outside the valid range, or with a non-integer type
+- **THEN** the extension SHALL load the affected key with the bootstrap default (`maxEditDistance = 2`, `minWordLength = 2`), preserving any other valid keys; the file SHALL NOT be auto-rewritten until the user explicitly sets a value
+
+#### Scenario: Third-level value completion for /typos config
+- **WHEN** the user types `/typos config maxEditDistance ` and triggers completion
+- **THEN** the extension SHALL suggest `1`, `2`, `3`; analogous suggestions apply to `minWordLength` (`2` through `8`) and `defaultMode` (`on`, `off`)

@@ -2,18 +2,27 @@ import type { ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi
 import type { AutocompleteItem } from "@mariozechner/pi-tui";
 
 import { AutocorrectEditor } from "./autocorrect-editor.js";
-import type { Config, DefaultMode } from "./config.js";
+import {
+  MAX_EDIT_DISTANCE_RANGE,
+  MIN_WORD_LENGTH_RANGE,
+  type Config,
+  type DefaultMode,
+} from "./config.js";
 import { CorrectionEngine, type CorrectionEngineOptions } from "./correction-engine.js";
 import type { LearnedDictionary } from "./learned-dictionary.js";
 
-const TOP_LEVEL_COMMANDS = ["on", "off", "dict", "default"] as const;
+const TOP_LEVEL_COMMANDS = ["on", "off", "dict", "default", "config"] as const;
 const DICTIONARY_SUBCOMMANDS = ["add", "remove", "search", "clear"] as const;
 const DEFAULT_SUBCOMMANDS = ["on", "off"] as const;
+const CONFIG_KEYS = ["defaultMode", "maxEditDistance", "minWordLength"] as const;
 const DICTIONARY_WORD_PATTERN = /^[A-Za-z]+$/;
 const MAX_DICTIONARY_RESULTS = 50;
 const DICTIONARY_USAGE = "Usage: /typos dict [search <term>|add <word>|remove <word>|clear]";
 const DEFAULT_USAGE = "Usage: /typos default [on|off]";
-const TOP_LEVEL_USAGE = "Unknown command. Usage: /typos [on|off|dict ...|default ...]";
+const CONFIG_USAGE = `Usage: /typos config [${CONFIG_KEYS.join("|")}] [<value>]`;
+const TOP_LEVEL_USAGE = "Unknown command. Usage: /typos [on|off|dict ...|default ...|config ...]";
+
+type ConfigKey = (typeof CONFIG_KEYS)[number];
 
 /**
  * Subset of {@link ExtensionContext} actually used by the typos command.
@@ -106,6 +115,16 @@ export function createTyposCommand({
       return;
     }
 
+    if (trimmedArgs === "config") {
+      showAllConfig(ctx);
+      return;
+    }
+
+    if (trimmedArgs.startsWith("config ")) {
+      await handleConfigCommand(ctx, trimmedArgs.slice(7));
+      return;
+    }
+
     ctx.ui.notify(TOP_LEVEL_USAGE, "warning");
   }
 
@@ -130,6 +149,28 @@ export function createTyposCommand({
         return null;
       }
       return buildSubcommandCompletions("default", DEFAULT_SUBCOMMANDS, defaultPrefix);
+    }
+
+    if (prefix.startsWith("config ")) {
+      const configRest = prefix.slice(7).trimStart();
+      const spaceAt = configRest.indexOf(" ");
+
+      // Second token: completing the config key.
+      if (spaceAt === -1) {
+        return buildSubcommandCompletions("config", CONFIG_KEYS, configRest);
+      }
+
+      // Third token: completing the value for a known key.
+      const key = configRest.slice(0, spaceAt);
+      const valuePrefix = configRest.slice(spaceAt + 1).trimStart();
+      if (valuePrefix.includes(" ")) {
+        return null;
+      }
+      const valueChoices = configValueChoices(key);
+      if (!valueChoices) {
+        return null;
+      }
+      return buildKeyValueCompletions("config", key, valueChoices, valuePrefix);
     }
 
     return null;
@@ -205,6 +246,8 @@ export function createTyposCommand({
         const engine = createCorrectionEngine({
           techDictPath,
           isLearned: (word) => learnedDictionary.has(word),
+          maxEditDistance: config.getMaxEditDistance(),
+          getMinWordLength: () => config.getMinWordLength(),
         });
 
         await engine.initialize();
@@ -304,6 +347,139 @@ export function createTyposCommand({
     }
 
     ctx.ui.notify(`Default mode for new sessions set to ${trimmed}`, "info");
+  }
+
+  function showAllConfig(ctx: TyposCommandContext): void {
+    const lines = [
+      `defaultMode      ${config.getDefaultMode()}`,
+      `maxEditDistance  ${config.getMaxEditDistance()}  (range ${MAX_EDIT_DISTANCE_RANGE.min}-${MAX_EDIT_DISTANCE_RANGE.max})`,
+      `minWordLength    ${config.getMinWordLength()}  (range ${MIN_WORD_LENGTH_RANGE.min}-${MIN_WORD_LENGTH_RANGE.max})`,
+    ];
+    ctx.ui.notify(`Mobile autocorrect config:\n${lines.join("\n")}`, "info");
+  }
+
+  async function handleConfigCommand(ctx: TyposCommandContext, rawArgs: string): Promise<void> {
+    const trimmed = rawArgs.trim();
+    if (trimmed.length === 0) {
+      showAllConfig(ctx);
+      return;
+    }
+
+    const firstSpace = trimmed.indexOf(" ");
+    const key = (firstSpace === -1 ? trimmed : trimmed.slice(0, firstSpace)) as ConfigKey;
+    const remainder = firstSpace === -1 ? "" : trimmed.slice(firstSpace + 1).trim();
+
+    if (!isConfigKey(key)) {
+      ctx.ui.notify(CONFIG_USAGE, "warning");
+      return;
+    }
+
+    if (remainder.length === 0) {
+      showSingleConfig(ctx, key);
+      return;
+    }
+
+    if (key === "defaultMode") {
+      // Reuse the validated path so /typos config defaultMode <v> stays in
+      // lock-step with /typos default <v>.
+      await handleDefaultModeCommand(ctx, remainder);
+      return;
+    }
+
+    if (key === "maxEditDistance") {
+      await handleSetMaxEditDistance(ctx, remainder);
+      return;
+    }
+
+    if (key === "minWordLength") {
+      await handleSetMinWordLength(ctx, remainder);
+      return;
+    }
+  }
+
+  function showSingleConfig(ctx: TyposCommandContext, key: ConfigKey): void {
+    switch (key) {
+      case "defaultMode":
+        ctx.ui.notify(`defaultMode = ${config.getDefaultMode()}`, "info");
+        return;
+      case "maxEditDistance":
+        ctx.ui.notify(
+          `maxEditDistance = ${config.getMaxEditDistance()} (range ${MAX_EDIT_DISTANCE_RANGE.min}-${MAX_EDIT_DISTANCE_RANGE.max})`,
+          "info",
+        );
+        return;
+      case "minWordLength":
+        ctx.ui.notify(
+          `minWordLength = ${config.getMinWordLength()} (range ${MIN_WORD_LENGTH_RANGE.min}-${MIN_WORD_LENGTH_RANGE.max})`,
+          "info",
+        );
+        return;
+    }
+  }
+
+  async function handleSetMaxEditDistance(ctx: TyposCommandContext, raw: string): Promise<void> {
+    const value = parseIntInRange(raw, MAX_EDIT_DISTANCE_RANGE);
+    if (value === undefined) {
+      ctx.ui.notify(
+        `Usage: /typos config maxEditDistance <integer ${MAX_EDIT_DISTANCE_RANGE.min}-${MAX_EDIT_DISTANCE_RANGE.max}>`,
+        "warning",
+      );
+      return;
+    }
+
+    if (config.getMaxEditDistance() === value) {
+      ctx.ui.notify(`maxEditDistance is already ${value}`, "info");
+      return;
+    }
+
+    try {
+      await config.setMaxEditDistance(value);
+    } catch (error) {
+      ctx.ui.notify(`Failed to save maxEditDistance: ${formatError(error)}`, "error");
+      return;
+    }
+
+    // maxEditDistance is baked into the SymSpell index at initialize().
+    // Drop the cached engine so the next enable() rebuilds with the new
+    // value. If autocorrect is currently running, tear it down and bring
+    // it right back up so the user sees the change take effect now
+    // (mirrors a manual /typos off; /typos on, but automated).
+    const wasEnabled = state.enabled;
+    if (wasEnabled) {
+      await disable(ctx);
+    }
+    state.engine = undefined;
+    ctx.ui.notify(`maxEditDistance set to ${value}`, "info");
+    if (wasEnabled) {
+      await enable(ctx);
+    }
+  }
+
+  async function handleSetMinWordLength(ctx: TyposCommandContext, raw: string): Promise<void> {
+    const value = parseIntInRange(raw, MIN_WORD_LENGTH_RANGE);
+    if (value === undefined) {
+      ctx.ui.notify(
+        `Usage: /typos config minWordLength <integer ${MIN_WORD_LENGTH_RANGE.min}-${MIN_WORD_LENGTH_RANGE.max}>`,
+        "warning",
+      );
+      return;
+    }
+
+    if (config.getMinWordLength() === value) {
+      ctx.ui.notify(`minWordLength is already ${value}`, "info");
+      return;
+    }
+
+    try {
+      await config.setMinWordLength(value);
+    } catch (error) {
+      ctx.ui.notify(`Failed to save minWordLength: ${formatError(error)}`, "error");
+      return;
+    }
+
+    // minWordLength is read live by the engine via getMinWordLength(), so
+    // no rebuild is needed — the next correction picks up the new value.
+    ctx.ui.notify(`minWordLength set to ${value}`, "info");
   }
 
   async function handleDictionaryCommand(ctx: TyposCommandContext, rawArgs: string): Promise<void> {
@@ -479,6 +655,59 @@ export function createTyposCommand({
 
 function isDefaultMode(value: string): value is DefaultMode {
   return value === "on" || value === "off";
+}
+
+function isConfigKey(value: string): value is ConfigKey {
+  return (CONFIG_KEYS as readonly string[]).includes(value);
+}
+
+function configValueChoices(key: string): readonly string[] | null {
+  if (key === "defaultMode") {
+    return DEFAULT_SUBCOMMANDS;
+  }
+  if (key === "maxEditDistance") {
+    return integerChoices(MAX_EDIT_DISTANCE_RANGE);
+  }
+  if (key === "minWordLength") {
+    return integerChoices(MIN_WORD_LENGTH_RANGE);
+  }
+  return null;
+}
+
+function integerChoices(range: { min: number; max: number }): readonly string[] {
+  const out: string[] = [];
+  for (let value = range.min; value <= range.max; value += 1) {
+    out.push(String(value));
+  }
+  return out;
+}
+
+function parseIntInRange(raw: string, range: { min: number; max: number }): number | undefined {
+  const trimmed = raw.trim();
+  if (!/^-?\d+$/.test(trimmed)) {
+    return undefined;
+  }
+  const parsed = Number.parseInt(trimmed, 10);
+  if (!Number.isInteger(parsed) || parsed < range.min || parsed > range.max) {
+    return undefined;
+  }
+  return parsed;
+}
+
+function buildKeyValueCompletions(
+  parent: string,
+  key: string,
+  values: readonly string[],
+  prefix: string,
+): AutocompleteItem[] | null {
+  const matches = values
+    .filter((value) => value.startsWith(prefix))
+    .map((value) => ({
+      label: value,
+      value: `${parent} ${key} ${value}`,
+    }));
+
+  return matches.length > 0 ? matches : null;
 }
 
 function buildCompletions(values: readonly string[], prefix: string): AutocompleteItem[] | null {

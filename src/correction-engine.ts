@@ -6,20 +6,39 @@ export type CorrectionResult = { corrected: false } | { corrected: true; suggest
 export interface CorrectionEngineOptions {
   techDictPath: string;
   isLearned: (word: string) => boolean;
+  /**
+   * Maximum SymSpell edit distance for typo lookups. Baked into the
+   * SymSpell index at initialize() time — callers must rebuild the engine
+   * (drop and re-create) to change it. Defaults to 2.
+   */
+  maxEditDistance?: number;
+  /**
+   * Live accessor for the minimum word length eligible for correction.
+   * Read on every shouldCorrect() call so that updates from `/typos config
+   * minWordLength <n>` take effect without rebuilding the engine. When
+   * omitted, defaults to 2.
+   */
+  getMinWordLength?: () => number;
 }
 
-const ELIGIBLE_WORD = /^[A-Za-z]{2,}$/;
+const FALLBACK_MAX_EDIT_DISTANCE = 2;
+const FALLBACK_MIN_WORD_LENGTH = 2;
 
 export class CorrectionEngine {
   private readonly techDictPath: string;
   private readonly isLearned: (word: string) => boolean;
+  private readonly maxEditDistance: number;
+  private readonly getMinWordLength: () => number;
   private symspell?: SymSpell;
   private techDict: Set<string> = new Set();
   private ready = false;
+  private cachedEligibleRegex?: { minLength: number; pattern: RegExp };
 
-  constructor({ techDictPath, isLearned }: CorrectionEngineOptions) {
+  constructor({ techDictPath, isLearned, maxEditDistance, getMinWordLength }: CorrectionEngineOptions) {
     this.techDictPath = techDictPath;
     this.isLearned = isLearned;
+    this.maxEditDistance = maxEditDistance ?? FALLBACK_MAX_EDIT_DISTANCE;
+    this.getMinWordLength = getMinWordLength ?? (() => FALLBACK_MIN_WORD_LENGTH);
   }
 
   async initialize(): Promise<void> {
@@ -28,7 +47,12 @@ export class CorrectionEngine {
     }
 
     try {
-      const symspell = new SymSpell(undefined, 2);
+      // First arg is initialCapacity (left at SymSpell's default), second is
+      // maxDictionaryEditDistance — the lookup-distance ceiling baked into
+      // the index. The third arg (prefixLength, default 7) is intentionally
+      // not exposed: it's an internal indexing tradeoff with no good user
+      // reason to fiddle with it.
+      const symspell = new SymSpell(undefined, this.maxEditDistance);
       loadDefaultDictionaries(symspell);
 
       const techDictionaryText = await readFile(this.techDictPath, "utf8");
@@ -51,7 +75,7 @@ export class CorrectionEngine {
   }
 
   shouldCorrect(word: string): CorrectionResult {
-    if (!ELIGIBLE_WORD.test(word)) {
+    if (!this.eligibleRegex().test(word)) {
       return { corrected: false };
     }
 
@@ -60,8 +84,9 @@ export class CorrectionEngine {
     }
 
     const lower = word.toLowerCase();
-    // edit distance 2: trades broader typo coverage for occasional false positives — tech-dict layer guards known terms
-    const suggestion = this.symspell.lookup(lower, Verbosity.Top, 2)[0];
+    // Edit distance trades typo coverage for false positives — tech-dict
+    // layer guards known terms. Driven by config (default 2).
+    const suggestion = this.symspell.lookup(lower, Verbosity.Top, this.maxEditDistance)[0];
 
     if (!suggestion) {
       return { corrected: false };
@@ -92,6 +117,19 @@ export class CorrectionEngine {
       corrected: true,
       suggestion: preserveCase(word, suggestion.term),
     };
+  }
+
+  private eligibleRegex(): RegExp {
+    const minLength = this.getMinWordLength();
+    if (this.cachedEligibleRegex?.minLength === minLength) {
+      return this.cachedEligibleRegex.pattern;
+    }
+    // Sanitize: a non-integer or out-of-range value would have been
+    // rejected at config write time, but defend against a buggy accessor.
+    const safeMinLength = Number.isInteger(minLength) && minLength >= 1 ? minLength : FALLBACK_MIN_WORD_LENGTH;
+    const pattern = new RegExp(`^[A-Za-z]{${safeMinLength},}$`);
+    this.cachedEligibleRegex = { minLength, pattern };
+    return pattern;
   }
 }
 

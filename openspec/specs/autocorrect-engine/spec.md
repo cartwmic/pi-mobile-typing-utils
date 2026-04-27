@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The correction engine maps eligible mistyped tokens to corrected forms using a layered dictionary lookup (learned, tech, English) and SymSpell distance-1 search. It is the pure function at the core of the mobile-autocorrect extension: given a word, return either no correction or a casing-preserved suggestion. It owns dictionary loading, identity-correction suppression, and case-preservation rules; it does NOT decide which tokens are eligible (the editor does) or persist anything (the learned dictionary does).
+The correction engine maps eligible mistyped tokens to corrected forms using a layered dictionary lookup (learned, tech, English) and SymSpell edit-distance search. It is the pure function at the core of the mobile-autocorrect extension: given a word, return either no correction or a casing-preserved suggestion. It owns dictionary loading, identity-correction suppression, and case-preservation rules; it does NOT decide which tokens are eligible by length (the editor and the user-configurable `minWordLength` do) or persist anything (the learned dictionary does). The engine accepts two tuning parameters at construction — `maxEditDistance` (baked into the SymSpell index) and a live `getMinWordLength()` accessor (read on every lookup) — both fed by the persisted extension config.
 
 ## Requirements
 
@@ -29,38 +29,46 @@ The correction engine SHALL check words against three dictionary layers in order
 - **WHEN** the user types "authorization", "function", or any word with an exact match in the English dictionary
 - **THEN** the engine SHALL return no correction for that word
 
-### Requirement: SymSpell correction with edit distance 1 and frequency ranking
-The engine SHALL use the SymSpell algorithm (Damerau-Levenshtein distance, where transpositions count as 1 edit) with a maximum edit distance of 1 and Verbosity.Top mode to find the single best correction for unknown words, ranked by word frequency.
+### Requirement: SymSpell correction with configurable edit distance and frequency ranking
+The engine SHALL use the SymSpell algorithm (Damerau-Levenshtein distance, where transpositions count as 1 edit) with `Verbosity.Top` mode to find the single best correction for unknown words, ranked by word frequency. The maximum edit distance SHALL be configurable per the `maxEditDistance` extension config (integer in `[1, 3]`, default `2`) and SHALL be baked into the SymSpell index at engine construction time. The same value SHALL be passed to `SymSpell.lookup` so the index and lookup distances agree.
 
 #### Scenario: Common mobile typo with single transposition
 - **WHEN** the user types "teh" (1 transposition from "the")
 - **THEN** the engine SHALL suggest "the" as the correction
 
 #### Scenario: Typo with multiple possible corrections
-- **WHEN** the user types a word that has multiple corrections at edit distance 1
+- **WHEN** the user types a word that has multiple corrections within the configured edit distance
 - **THEN** the engine SHALL return the correction with the highest frequency count
 
-#### Scenario: Word requiring edit distance 2 or more
-- **WHEN** the user types a word that has no match within edit distance 1
-- **THEN** the engine SHALL return no correction (not attempt distance 2)
+#### Scenario: Word beyond the configured edit distance
+- **WHEN** the user types a word that has no match within the configured `maxEditDistance`
+- **THEN** the engine SHALL return no correction (it SHALL NOT widen the search beyond the configured value)
+
+#### Scenario: maxEditDistance change requires engine rebuild
+- **WHEN** the user changes `maxEditDistance` via `/typos config maxEditDistance <n>`
+- **THEN** the cached engine SHALL be discarded and the next engine instance SHALL be constructed with the new value (see toggle-command spec for the user-facing flow); the running engine SHALL continue using its construction-time value until replaced
 
 #### Scenario: Identity correction suppressed
 - **WHEN** SymSpell returns the same word as the input (e.g., "the" → "the" at distance 0)
 - **THEN** the engine SHALL return `{ corrected: false }`, NOT fire a correction event
 
-### Requirement: Verify Damerau-Levenshtein before building on distance-1 assumption
-Before the engine is built, the implementation SHALL verify that symspell-ts uses Damerau-Levenshtein (transpositions = 1 edit), not plain Levenshtein (transpositions = 2 edits). If plain Levenshtein, the max edit distance or the library choice SHALL be revisited.
+### Requirement: Verify Damerau-Levenshtein semantics
+Before the engine is built, the implementation SHALL verify that symspell-ts uses Damerau-Levenshtein (transpositions = 1 edit), not plain Levenshtein (transpositions = 2 edits). If plain Levenshtein were used, the practical reach of any given `maxEditDistance` would shrink by half on transposition-style typos.
 
 #### Scenario: Verification test
 - **WHEN** the engine is initialized with the English dictionary
 - **THEN** `lookup("teh", Verbosity.Top, 1)` SHALL return "the" with distance 1, confirming transpositions are counted as a single edit
 
 ### Requirement: Short words are not corrected
-The engine SHALL NOT attempt to correct words shorter than 2 characters, regardless of whether they match any dictionary.
+The engine SHALL NOT attempt to correct words shorter than the configured `minWordLength` (integer in `[2, 8]`, default `2`), regardless of whether they match any dictionary. The threshold SHALL be read live on every `shouldCorrect` call via the `getMinWordLength` accessor passed at construction, so updates from `/typos config minWordLength <n>` take effect on the next lookup without rebuilding the engine. The internal eligibility regex MAY be cached so long as the cache is invalidated when the accessor's return value changes.
 
-#### Scenario: One-character input
-- **WHEN** the user types any word with fewer than 2 characters (i.e., a single character)
+#### Scenario: Word shorter than the threshold
+- **WHEN** the user types a word shorter than the configured `minWordLength`
 - **THEN** the engine SHALL return no correction
+
+#### Scenario: minWordLength change is observed live
+- **WHEN** the user changes `minWordLength` via `/typos config minWordLength <n>` while autocorrect is running
+- **THEN** the next correction lookup SHALL use the new threshold without the engine being rebuilt
 
 ### Requirement: Case preservation on corrections
 When the engine returns a correction, it SHALL preserve the case pattern of the original word. Specifically: if the original word starts with an uppercase letter followed by lowercase, the correction SHALL have the same leading-uppercase pattern.

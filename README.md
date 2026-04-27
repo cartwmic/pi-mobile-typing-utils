@@ -48,6 +48,18 @@ Configure the default mode for new sessions:
 
 The value is persisted to `~/.pi/agent/mobile-autocorrect-config.json` (override with `MOBILE_AUTOCORRECT_CONFIG_PATH`). On every session start the extension reconciles the session to the configured mode in both directions, silently when state already matches.
 
+Tune the correction engine:
+
+- `/typos config` — list all configured values with their ranges.
+- `/typos config <key>` — show one value (`defaultMode`, `maxEditDistance`, `minWordLength`).
+- `/typos config <key> <value>` — set and persist.
+
+Knobs:
+
+- `defaultMode` (`on`/`off`, default `off`) — same value the dedicated `/typos default` command edits.
+- `maxEditDistance` (integer `1`–`3`, default `2`) — SymSpell lookup distance. Higher catches more typos but produces more false positives and grows memory cost. The change takes effect on the next correction; if autocorrect is currently running, the engine is hot-reloaded automatically.
+- `minWordLength` (integer `2`–`8`, default `2`) — minimum word length eligible for correction. Higher = fewer false positives on short noisy sequences but you stop correcting things like `te` → `be`. Read live by the engine; takes effect on the next lookup with no rebuild.
+
 ## How it works
 
 - **Three-layer dictionary lookup:** learned words first, bundled tech terms second, bundled SymSpell English last.
