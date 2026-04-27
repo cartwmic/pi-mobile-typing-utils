@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The `/typos` command is the user-facing control surface for autocorrect. It supports `on`, `off`, bare-toggle, status reporting, idempotent re-issue, lazy engine initialization with status feedback, async-init serialization (final state wins), and routes `dict` subcommands to dictionary management. Autocorrect state is per-session — each new Pi session starts with autocorrect disabled, regardless of the prior session's state.
+The `/typos` command is the user-facing control surface for autocorrect. It supports `on`, `off`, bare-toggle, status reporting, idempotent re-issue, lazy engine initialization with status feedback, async-init serialization (final state wins), routes `dict` subcommands to dictionary management, and routes `default` subcommands to per-extension configuration of the default mode for new sessions. Autocorrect state is per-session — each new Pi session starts in the configured default mode (which itself defaults to disabled if never set), regardless of the prior session's state.
 
 ## Requirements
 
@@ -44,11 +44,50 @@ The `/typos` command with no arguments SHALL toggle autocorrect: enable if disab
 - **THEN** autocorrect SHALL be disabled and a notification SHALL show "Autocorrect OFF"
 
 ### Requirement: Autocorrect state is per-session
-Autocorrect state SHALL NOT persist across Pi sessions. Each new session SHALL start with autocorrect disabled (default state). The learned dictionary loads at extension init (for `/typos dict` availability); correction-engine dictionaries (English + tech) are not loaded until first enable.
+Autocorrect state SHALL NOT persist across Pi sessions. Each new session SHALL start in the configured default mode (see "Default mode configuration"); when no default mode has been configured, sessions SHALL start with autocorrect disabled. The learned dictionary loads at extension init (for `/typos dict` availability); correction-engine dictionaries (English + tech) are not loaded until first enable.
 
-#### Scenario: New session starts disabled
+#### Scenario: New session starts in the configured default mode
 - **WHEN** the user starts a new Pi session
-- **THEN** autocorrect SHALL be disabled; the learned dictionary SHALL be loaded (for `/typos dict` availability) but the correction-engine dictionaries (English + tech) SHALL NOT be loaded until first enable
+- **THEN** autocorrect SHALL be reconciled to the configured default mode; when no default mode has been configured, autocorrect SHALL be disabled; the learned dictionary SHALL be loaded (for `/typos dict` availability) but the correction-engine dictionaries (English + tech) SHALL NOT be loaded until first enable (or until the configured default mode is `on`, in which case they load as part of session-start reconciliation)
+
+### Requirement: Default mode configuration
+The extension SHALL persist a `defaultMode` configuration value that controls the autocorrect state new sessions start in. The configuration SHALL be stored in a JSON file at `~/.pi/agent/mobile-autocorrect-config.json` by default, overridable via the `MOBILE_AUTOCORRECT_CONFIG_PATH` environment variable. The bootstrap value of `defaultMode` SHALL be `"off"`, preserving the long-standing per-session behavior for users who never configure it. The `/typos default` subcommand SHALL expose this configuration, and on every `session_start` event the extension SHALL reconcile session state to the configured value, in both directions (off→on and on→off), with already-in-state cases as silent no-ops.
+
+#### Scenario: Inspect the current default mode
+- **WHEN** the user runs `/typos default`
+- **THEN** the extension SHALL show "Default mode for new sessions: <mode>" where `<mode>` is the current configured value (`on` or `off`)
+
+#### Scenario: Configure default mode to on
+- **WHEN** the user runs `/typos default on` and the previous configured value is `off`
+- **THEN** the configuration SHALL be persisted to disk with `defaultMode: "on"` and a notification SHALL show "Default mode for new sessions set to on"
+
+#### Scenario: Configure default mode to off
+- **WHEN** the user runs `/typos default off` and the previous configured value is `on`
+- **THEN** the configuration SHALL be persisted to disk with `defaultMode: "off"` and a notification SHALL show "Default mode for new sessions set to off"
+
+#### Scenario: Re-issuing the current default mode is idempotent
+- **WHEN** the user runs `/typos default off` and the configured value is already `off`
+- **THEN** the configuration file SHALL NOT be rewritten and the notification SHALL show "Default mode is already off"; the same idempotent behavior applies to `/typos default on` when already `on`
+
+#### Scenario: Reject invalid default mode arguments
+- **WHEN** the user runs `/typos default <anything other than on or off>`
+- **THEN** the extension SHALL show "Usage: /typos default [on|off]" and SHALL NOT modify the configuration
+
+#### Scenario: Session-start reconciliation when default is on
+- **WHEN** a session_start event fires (reason `startup`, `reload`, `new`, `resume`, or `fork`) and the configured default mode is `on` and autocorrect is currently disabled
+- **THEN** the extension SHALL go through the same enable path as `/typos on`, including lazy engine initialization, the editor swap, the persistent status indicator, and the "Autocorrect ON" notification
+
+#### Scenario: Session-start reconciliation when default is off
+- **WHEN** a session_start event fires and the configured default mode is `off` and autocorrect is currently enabled (e.g. carried over from a prior session via session switch)
+- **THEN** the extension SHALL go through the same disable path as `/typos off`, including the editor restore, the status-indicator clear, and the "Autocorrect OFF" notification
+
+#### Scenario: Session-start reconciliation is silent when state already matches
+- **WHEN** a session_start event fires and autocorrect is already in the configured default mode
+- **THEN** the extension SHALL NOT emit any notification and SHALL NOT toggle the editor or status indicator
+
+#### Scenario: Malformed config file is tolerated
+- **WHEN** the configuration file exists but contains invalid JSON or an unknown `defaultMode` value
+- **THEN** the extension SHALL load with the bootstrap default (`defaultMode: "off"`) and SHALL log a warning, without crashing extension initialization
 
 ### Requirement: Toggle serialization during async initialization
 Enable/disable operations SHALL be serialized via an in-flight promise. Concurrent toggle commands SHALL await the in-flight operation and then apply the requested state. The final requested state wins.
@@ -80,12 +119,16 @@ The `/typos` command SHALL route arguments starting with "dict" to the dictionar
 - **THEN** the word SHALL be added to the learned dictionary (dictionary management is always available)
 
 ### Requirement: Argument auto-completion for /typos command
-The `/typos` command SHALL provide argument completions via `getArgumentCompletions`. First-level completions SHALL include `on`, `off`, `dict`. When the first argument is `dict`, second-level completions SHALL include `add`, `remove`, `search`, `clear`.
+The `/typos` command SHALL provide argument completions via `getArgumentCompletions`. First-level completions SHALL include `on`, `off`, `dict`, `default`. When the first argument is `dict`, second-level completions SHALL include `add`, `remove`, `search`, `clear`. When the first argument is `default`, second-level completions SHALL include `on`, `off`.
 
 #### Scenario: First-level completion
 - **WHEN** the user types `/typos ` and triggers completion
-- **THEN** the extension SHALL suggest `on`, `off`, `dict`
+- **THEN** the extension SHALL suggest `on`, `off`, `dict`, `default`
 
 #### Scenario: Second-level dict completion
 - **WHEN** the user types `/typos dict ` and triggers completion
 - **THEN** the extension SHALL suggest `add`, `remove`, `search`, `clear`
+
+#### Scenario: Second-level default completion
+- **WHEN** the user types `/typos default ` and triggers completion
+- **THEN** the extension SHALL suggest `on`, `off`

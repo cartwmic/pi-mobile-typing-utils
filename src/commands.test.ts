@@ -7,6 +7,7 @@ import type { ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { createTyposCommand } from "./commands.js";
+import { Config } from "./config.js";
 import { LearnedDictionary } from "./learned-dictionary.js";
 
 type Notification = {
@@ -67,6 +68,7 @@ describe("createTyposCommand", () => {
     const command = createTyposCommand({
       learnedDictionary: dictionary,
       techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
       createCorrectionEngine: () => ({ initialize } as never),
       createAutocorrectEditor: (() => ({}) as never) as never,
     });
@@ -106,6 +108,7 @@ describe("createTyposCommand", () => {
     const command = createTyposCommand({
       learnedDictionary: dictionary,
       techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
       createCorrectionEngine: () => ({ initialize } as never),
       createAutocorrectEditor: (() => ({}) as never) as never,
     });
@@ -138,6 +141,7 @@ describe("createTyposCommand", () => {
     const command = createTyposCommand({
       learnedDictionary: dictionary,
       techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
       createCorrectionEngine: () => ({ initialize } as never),
       createAutocorrectEditor: (() => ({}) as never) as never,
     });
@@ -174,6 +178,7 @@ describe("createTyposCommand", () => {
     const command = createTyposCommand({
       learnedDictionary: dictionary,
       techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
     });
     const ctx = createCommandContext();
 
@@ -209,6 +214,7 @@ describe("createTyposCommand", () => {
     const command = createTyposCommand({
       learnedDictionary: dictionary,
       techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
     });
     const ctx = createCommandContext();
 
@@ -241,6 +247,7 @@ describe("createTyposCommand", () => {
     const command = createTyposCommand({
       learnedDictionary: dictionary,
       techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
     });
     const ctx = createCommandContext();
 
@@ -265,6 +272,7 @@ describe("createTyposCommand", () => {
     const command = createTyposCommand({
       learnedDictionary: dictionary,
       techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
     });
     const ctx = createCommandContext();
 
@@ -282,6 +290,7 @@ describe("createTyposCommand", () => {
     const command = createTyposCommand({
       learnedDictionary: dictionary,
       techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
     });
     const ctx = createCommandContext();
 
@@ -301,6 +310,7 @@ describe("createTyposCommand", () => {
     const command = createTyposCommand({
       learnedDictionary: dictionary,
       techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
     });
     const ctx = createCommandContext();
 
@@ -317,6 +327,7 @@ describe("createTyposCommand", () => {
     const command = createTyposCommand({
       learnedDictionary: dictionary,
       techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
     });
     const ctx = createCommandContext({ confirmResult: false });
 
@@ -335,6 +346,7 @@ describe("createTyposCommand", () => {
     const command = createTyposCommand({
       learnedDictionary: dictionary,
       techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
     });
     const ctx = createCommandContext();
 
@@ -343,7 +355,7 @@ describe("createTyposCommand", () => {
     await command.handler("dict search", ctx);
 
     expect(ctx.notifications).toEqual([
-      { message: "Unknown command. Usage: /typos [on|off|dict ...]", level: "warning" },
+      { message: "Unknown command. Usage: /typos [on|off|dict ...|default ...]", level: "warning" },
       { message: "Usage: /typos dict [search <term>|add <word>|remove <word>|clear]", level: "warning" },
       { message: "Usage: /typos dict search <term>", level: "warning" },
     ]);
@@ -354,11 +366,14 @@ describe("createTyposCommand", () => {
     const command = createTyposCommand({
       learnedDictionary: dictionary,
       techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
     });
 
-    expect(command.getArgumentCompletions("")?.map((item) => item.value)).toEqual(["on", "off", "dict"]);
+    expect(command.getArgumentCompletions("")?.map((item) => item.value)).toEqual(["on", "off", "dict", "default"]);
     expect(command.getArgumentCompletions("o")?.map((item) => item.value)).toEqual(["on", "off"]);
-    expect(command.getArgumentCompletions("d")?.map((item) => item.value)).toEqual(["dict"]);
+    expect(command.getArgumentCompletions("d")?.map((item) => item.value)).toEqual(["dict", "default"]);
+    expect(command.getArgumentCompletions("di")?.map((item) => item.value)).toEqual(["dict"]);
+    expect(command.getArgumentCompletions("def")?.map((item) => item.value)).toEqual(["default"]);
     expect(command.getArgumentCompletions("dict ")?.map((item) => item.value)).toEqual([
       "add",
       "remove",
@@ -366,11 +381,166 @@ describe("createTyposCommand", () => {
       "clear",
     ]);
     expect(command.getArgumentCompletions("dict s")?.map((item) => item.value)).toEqual(["search"]);
+    expect(command.getArgumentCompletions("default ")?.map((item) => item.value)).toEqual(["on", "off"]);
+    expect(command.getArgumentCompletions("default o")?.map((item) => item.value)).toEqual(["on", "off"]);
+    expect(command.getArgumentCompletions("default of")?.map((item) => item.value)).toEqual(["off"]);
+  });
+
+  test("/typos default reports the current default mode", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("default", ctx);
+
+    expect(ctx.notifications).toEqual([
+      { message: "Default mode for new sessions: off", level: "info" },
+    ]);
+  });
+
+  test("/typos default on persists the new default mode and notifies", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("default on", ctx);
+
+    expect(config.getDefaultMode()).toBe("on");
+    expect(ctx.notifications.at(-1)).toEqual({
+      message: "Default mode for new sessions set to on",
+      level: "info",
+    });
+
+    // A second handler instance loading the same file should observe the change.
+    const reloaded = new Config({ filePath: (config as unknown as { filePath: string }).filePath });
+    await reloaded.load();
+    expect(reloaded.getDefaultMode()).toBe("on");
+  });
+
+  test("/typos default off is a no-op when already off", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("default off", ctx);
+
+    expect(ctx.notifications.at(-1)).toEqual({
+      message: "Default mode is already off",
+      level: "info",
+    });
+  });
+
+  test("/typos default rejects unknown sub-arguments", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("default maybe", ctx);
+
+    expect(ctx.notifications.at(-1)).toEqual({
+      message: "Usage: /typos default [on|off]",
+      level: "warning",
+    });
+    expect(config.getDefaultMode()).toBe("off");
+  });
+
+  test("applyDefaultMode enables autocorrect when defaultMode is on", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    await config.setDefaultMode("on");
+
+    const initialize = vi.fn(async () => undefined);
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+      createCorrectionEngine: () => ({ initialize } as never),
+      createAutocorrectEditor: (() => ({}) as never) as never,
+    });
+    const ctx = createCommandContext();
+
+    await command.applyDefaultMode(ctx);
+
+    expect(command.state.enabled).toBe(true);
+    expect(initialize).toHaveBeenCalledTimes(1);
+    expect(ctx.notifications.at(-1)).toEqual({ message: "Autocorrect ON", level: "info" });
+  });
+
+  test("applyDefaultMode is a silent no-op when state already matches default", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    // defaultMode left at the bootstrap value "off".
+
+    const initialize = vi.fn(async () => undefined);
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+      createCorrectionEngine: () => ({ initialize } as never),
+      createAutocorrectEditor: (() => ({}) as never) as never,
+    });
+    const ctx = createCommandContext();
+
+    await command.applyDefaultMode(ctx);
+
+    expect(command.state.enabled).toBe(false);
+    expect(initialize).not.toHaveBeenCalled();
+    expect(ctx.notifications).toEqual([]);
+  });
+
+  test("applyDefaultMode disables a session that is on when defaultMode is off", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    // defaultMode "off" — also asserts the reverse-direction reconcile.
+
+    const initialize = vi.fn(async () => undefined);
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+      createCorrectionEngine: () => ({ initialize } as never),
+      createAutocorrectEditor: (() => ({}) as never) as never,
+    });
+    const ctx = createCommandContext();
+
+    // Force the command into the enabled state via the public toggle path.
+    await command.handler("on", ctx);
+    expect(command.state.enabled).toBe(true);
+
+    await command.applyDefaultMode(ctx);
+
+    expect(command.state.enabled).toBe(false);
+    expect(ctx.notifications.at(-1)).toEqual({ message: "Autocorrect OFF", level: "info" });
   });
 
   async function createDictionary(): Promise<LearnedDictionary> {
     const filePath = join(tempDir, `dictionary-${randomUUID()}.json`);
     return new LearnedDictionary({ filePath });
+  }
+
+  function createConfig(): Config {
+    const filePath = join(tempDir, `config-${randomUUID()}.json`);
+    return new Config({ filePath });
   }
 });
 

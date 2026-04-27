@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
 import { createTyposCommand } from "./src/commands.js";
+import { Config } from "./src/config.js";
 import { LearnedDictionary } from "./src/learned-dictionary.js";
 
 // Native ESM runtime code must resolve packaged assets via import.meta.url.
@@ -24,14 +25,29 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   await learnedDictionary.load();
 
+  const config = new Config({
+    filePath:
+      process.env.MOBILE_AUTOCORRECT_CONFIG_PATH ??
+      join(homedir(), ".pi", "agent", "mobile-autocorrect-config.json"),
+  });
+
+  await config.load();
+
   const typosCommand = createTyposCommand({
     learnedDictionary,
     techDictPath: TECH_DICTIONARY_PATH,
+    config,
   });
 
   pi.registerCommand("typos", {
     description: "Toggle mobile autocorrect (gboard-style word-by-word correction)",
     getArgumentCompletions: typosCommand.getArgumentCompletions,
     handler: typosCommand.handler,
+  });
+
+  // Reconcile session state with the configured default mode on every
+  // session_start. Idempotent and silent when already in the desired state.
+  pi.on("session_start", async (_event, ctx) => {
+    await typosCommand.applyDefaultMode(ctx);
   });
 }

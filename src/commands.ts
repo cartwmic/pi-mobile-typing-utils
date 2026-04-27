@@ -1,16 +1,28 @@
-import type { ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { AutocompleteItem } from "@mariozechner/pi-tui";
 
 import { AutocorrectEditor } from "./autocorrect-editor.js";
+import type { Config, DefaultMode } from "./config.js";
 import { CorrectionEngine, type CorrectionEngineOptions } from "./correction-engine.js";
 import type { LearnedDictionary } from "./learned-dictionary.js";
 
-const TOP_LEVEL_COMMANDS = ["on", "off", "dict"] as const;
+const TOP_LEVEL_COMMANDS = ["on", "off", "dict", "default"] as const;
 const DICTIONARY_SUBCOMMANDS = ["add", "remove", "search", "clear"] as const;
+const DEFAULT_SUBCOMMANDS = ["on", "off"] as const;
 const DICTIONARY_WORD_PATTERN = /^[A-Za-z]+$/;
 const MAX_DICTIONARY_RESULTS = 50;
 const DICTIONARY_USAGE = "Usage: /typos dict [search <term>|add <word>|remove <word>|clear]";
-const TOP_LEVEL_USAGE = "Unknown command. Usage: /typos [on|off|dict ...]";
+const DEFAULT_USAGE = "Usage: /typos default [on|off]";
+const TOP_LEVEL_USAGE = "Unknown command. Usage: /typos [on|off|dict ...|default ...]";
+
+/**
+ * Subset of {@link ExtensionContext} actually used by the typos command.
+ * Both `ExtensionCommandContext` (passed to `registerCommand` handlers) and
+ * `ExtensionContext` (passed to `pi.on("session_start", ...)` handlers) satisfy
+ * this — letting `applyDefaultMode` reuse the same enable/disable plumbing
+ * from a session-start hook.
+ */
+export type TyposCommandContext = Pick<ExtensionContext, "ui">;
 const EMPTY_DICTIONARY_MESSAGE =
   "No words in dictionary yet. Words are learned when you reject a correction by pressing backspace within 1 character of the correction.";
 
@@ -23,6 +35,7 @@ export type TyposCommandState = {
 export type CreateTyposCommandOptions = {
   learnedDictionary: LearnedDictionary;
   techDictPath: string;
+  config: Config;
   createCorrectionEngine?: (options: CorrectionEngineOptions) => CorrectionEngine;
   createAutocorrectEditor?: (...args: ConstructorParameters<typeof AutocorrectEditor>) => AutocorrectEditor;
 };
@@ -32,12 +45,20 @@ type ScheduledAction = "enable" | "disable" | "toggle";
 export function createTyposCommand({
   learnedDictionary,
   techDictPath,
+  config,
   createCorrectionEngine = (options) => new CorrectionEngine(options),
   createAutocorrectEditor = (...args) => new AutocorrectEditor(...args),
 }: CreateTyposCommandOptions): {
   state: TyposCommandState;
   handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
   getArgumentCompletions: (argumentPrefix: string) => AutocompleteItem[] | null;
+  /**
+   * Reconcile session state with the configured default mode. Intended to be
+   * called from a `session_start` event handler. Silent no-op when already in
+   * the desired state; otherwise transitions through the same
+   * enable/disable path as a user-issued `/typos on|off`.
+   */
+  applyDefaultMode: (ctx: TyposCommandContext) => Promise<void>;
 } {
   const state: TyposCommandState = {
     enabled: false,
@@ -75,6 +96,16 @@ export function createTyposCommand({
       return;
     }
 
+    if (trimmedArgs === "default") {
+      showDefaultMode(ctx);
+      return;
+    }
+
+    if (trimmedArgs.startsWith("default ")) {
+      await handleDefaultModeCommand(ctx, trimmedArgs.slice(8));
+      return;
+    }
+
     ctx.ui.notify(TOP_LEVEL_USAGE, "warning");
   }
 
@@ -85,20 +116,26 @@ export function createTyposCommand({
       return buildCompletions(TOP_LEVEL_COMMANDS, prefix);
     }
 
-    if (!prefix.startsWith("dict ")) {
-      return null;
+    if (prefix.startsWith("dict ")) {
+      const dictPrefix = prefix.slice(5).trimStart();
+      if (dictPrefix.includes(" ")) {
+        return null;
+      }
+      return buildCompletions(DICTIONARY_SUBCOMMANDS, dictPrefix);
     }
 
-    const dictPrefix = prefix.slice(5).trimStart();
-
-    if (dictPrefix.includes(" ")) {
-      return null;
+    if (prefix.startsWith("default ")) {
+      const defaultPrefix = prefix.slice(8).trimStart();
+      if (defaultPrefix.includes(" ")) {
+        return null;
+      }
+      return buildCompletions(DEFAULT_SUBCOMMANDS, defaultPrefix);
     }
 
-    return buildCompletions(DICTIONARY_SUBCOMMANDS, dictPrefix);
+    return null;
   }
 
-  async function requestExplicitToggle(ctx: ExtensionCommandContext, enabled: boolean): Promise<void> {
+  async function requestExplicitToggle(ctx: TyposCommandContext, enabled: boolean): Promise<void> {
     const requestedAction = enabled ? "enable" : "disable";
 
     if (state.toggleInFlight && queuedTailAction === requestedAction) {
@@ -109,7 +146,7 @@ export function createTyposCommand({
     await scheduleToggle(ctx, requestedAction);
   }
 
-  async function scheduleToggle(ctx: ExtensionCommandContext, action: ScheduledAction): Promise<void> {
+  async function scheduleToggle(ctx: TyposCommandContext, action: ScheduledAction): Promise<void> {
     const previous = state.toggleInFlight ?? Promise.resolve();
     const token = Symbol(action);
 
@@ -155,7 +192,7 @@ export function createTyposCommand({
     await tracked;
   }
 
-  async function enable(ctx: ExtensionCommandContext): Promise<void> {
+  async function enable(ctx: TyposCommandContext): Promise<void> {
     if (state.enabled) {
       ctx.ui.notify("Autocorrect is already on", "info");
       return;
@@ -195,7 +232,7 @@ export function createTyposCommand({
     ctx.ui.notify("Autocorrect ON", "info");
   }
 
-  async function disable(ctx: ExtensionCommandContext): Promise<void> {
+  async function disable(ctx: TyposCommandContext): Promise<void> {
     if (!state.enabled) {
       ctx.ui.notify("Autocorrect is already off", "info");
       return;
@@ -207,7 +244,69 @@ export function createTyposCommand({
     ctx.ui.notify("Autocorrect OFF", "info");
   }
 
-  async function handleDictionaryCommand(ctx: ExtensionCommandContext, rawArgs: string): Promise<void> {
+  async function applyDefaultMode(ctx: TyposCommandContext): Promise<void> {
+    if (state.toggleInFlight) {
+      try {
+        await state.toggleInFlight;
+      } catch {
+        // Prior toggle failed; we still want to attempt reconciliation.
+      }
+    }
+
+    const desired = config.getDefaultMode();
+
+    // The configured `defaultMode` is the single source of truth for new
+    // sessions and replaces the prior hardcoded "always off" default. The
+    // config field's own bootstrap value is "off", so unconfigured users
+    // see no behavior change. When the user sets it to "on", session_start
+    // reconciles to enabled; flipping it back to "off" reconciles to
+    // disabled. Already-in-state cases are silent no-ops to avoid spamming
+    // "already on/off" toasts during session switches.
+    if (desired === "on" && !state.enabled) {
+      await scheduleToggle(ctx, "enable");
+      return;
+    }
+
+    if (desired === "off" && state.enabled) {
+      await scheduleToggle(ctx, "disable");
+    }
+  }
+
+  function showDefaultMode(ctx: TyposCommandContext): void {
+    const mode = config.getDefaultMode();
+    ctx.ui.notify(`Default mode for new sessions: ${mode}`, "info");
+  }
+
+  async function handleDefaultModeCommand(ctx: TyposCommandContext, rawArgs: string): Promise<void> {
+    const trimmed = rawArgs.trim();
+
+    if (trimmed.length === 0) {
+      showDefaultMode(ctx);
+      return;
+    }
+
+    if (!isDefaultMode(trimmed)) {
+      ctx.ui.notify(DEFAULT_USAGE, "warning");
+      return;
+    }
+
+    const previous = config.getDefaultMode();
+    if (previous === trimmed) {
+      ctx.ui.notify(`Default mode is already ${trimmed}`, "info");
+      return;
+    }
+
+    try {
+      await config.setDefaultMode(trimmed);
+    } catch (error) {
+      ctx.ui.notify(`Failed to save default mode: ${formatError(error)}`, "error");
+      return;
+    }
+
+    ctx.ui.notify(`Default mode for new sessions set to ${trimmed}`, "info");
+  }
+
+  async function handleDictionaryCommand(ctx: TyposCommandContext, rawArgs: string): Promise<void> {
     const trimmedArgs = rawArgs.trim();
 
     if (trimmedArgs.length === 0) {
@@ -305,7 +404,7 @@ export function createTyposCommand({
   }
 
   function showDictionary(
-    ctx: ExtensionCommandContext,
+    ctx: TyposCommandContext,
     entries: ReturnType<LearnedDictionary["getAll"]>,
     options?: { totalLabel: "words" | "matches"; truncatedNote?: string; pendingMatchCount?: number },
   ): void {
@@ -336,7 +435,7 @@ export function createTyposCommand({
     ctx.ui.notify(message, "info");
   }
 
-  function showBareDict(ctx: ExtensionCommandContext, dictionary: LearnedDictionary): void {
+  function showBareDict(ctx: TyposCommandContext, dictionary: LearnedDictionary): void {
     const graduated = dictionary.getAll();
     const pending = dictionary.getPending();
 
@@ -374,7 +473,12 @@ export function createTyposCommand({
     state,
     handler,
     getArgumentCompletions,
+    applyDefaultMode,
   };
+}
+
+function isDefaultMode(value: string): value is DefaultMode {
+  return value === "on" || value === "off";
 }
 
 function buildCompletions(values: readonly string[], prefix: string): AutocompleteItem[] | null {

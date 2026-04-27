@@ -40,6 +40,14 @@ Manage the learned dictionary:
 - `/typos dict remove <word>`
 - `/typos dict clear`
 
+Configure the default mode for new sessions:
+
+- `/typos default` — show the current configured default (`on` or `off`).
+- `/typos default on` — new sessions start with autocorrect enabled.
+- `/typos default off` — new sessions start with autocorrect disabled (the bootstrap default; matches the original per-session behavior).
+
+The value is persisted to `~/.pi/agent/mobile-autocorrect-config.json` (override with `MOBILE_AUTOCORRECT_CONFIG_PATH`). On every session start the extension reconciles the session to the configured mode in both directions, silently when state already matches.
+
 ## How it works
 
 - **Three-layer dictionary lookup:** learned words first, bundled tech terms second, bundled SymSpell English last.

@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/) and this project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `/typos default [on|off]` subcommand and persistent extension configuration (`~/.pi/agent/mobile-autocorrect-config.json`, override with `MOBILE_AUTOCORRECT_CONFIG_PATH`) to control the autocorrect mode new sessions start in. The bootstrap value is `off`, preserving prior per-session behavior; setting it to `on` reconciles every `session_start` event to enabled. Reconciliation is bidirectional and silent when state already matches.
+
 ## [0.1.0] - 2026-04-26
 
 ### Added
