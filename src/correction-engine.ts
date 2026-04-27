@@ -8,7 +8,7 @@ export interface CorrectionEngineOptions {
   isLearned: (word: string) => boolean;
 }
 
-const ELIGIBLE_WORD = /^[A-Za-z]{3,}$/;
+const ELIGIBLE_WORD = /^[A-Za-z]{2,}$/;
 
 export class CorrectionEngine {
   private readonly techDictPath: string;

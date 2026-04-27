@@ -25,7 +25,7 @@ type CorrectionState = {
 };
 
 const TRIGGER_CHARS = new Set([" ", ".", ",", ";", ":", "!", "?"]);
-const ELIGIBLE_TOKEN = /^[A-Za-z]{3,}$/;
+const ELIGIBLE_TOKEN = /^[A-Za-z]{2,}$/;
 const SAFE_BOUNDARY_CHARS = new Set([" ", "\t", "\n", "\r", "(", ")", "[", "]", "{", "}", '"', ",", ";", ":", "!", "?"]);
 const REJECTION_CAP = 32;
 const STATUS_KEY = "typos-correction";

@@ -48,9 +48,18 @@ describe("CorrectionEngine", () => {
   });
 
   test("skips short words", () => {
+    // Single-character words still fail the min-length-2 guard.
+    // Two-character valid English words ("to", "is") pass the guard but are
+    // identity-suppressed (SymSpell returns them at distance 0).
     expect(engine.shouldCorrect("a")).toEqual({ corrected: false });
     expect(engine.shouldCorrect("to")).toEqual({ corrected: false });
     expect(engine.shouldCorrect("is")).toEqual({ corrected: false });
+  });
+
+  test("2-letter typos are now eligible for correction (min length 2)", () => {
+    // "og" is a 2-letter token: previously filtered by the {3,} guard, now
+    // eligible with {2,}. SymSpell suggests "of" at edit distance 1.
+    expect(engine.shouldCorrect("og")).toEqual({ corrected: true, suggestion: "of" });
   });
 
   test("leaves unknown novel words alone", () => {

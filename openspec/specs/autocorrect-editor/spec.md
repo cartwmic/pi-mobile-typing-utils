@@ -26,7 +26,7 @@ The editor SHALL only send tokens to the correction engine that match natural-la
 - **THEN** the editor SHALL NOT attempt to correct it
 
 #### Scenario: Plain word is eligible
-- **WHEN** the user types `teh ` (space after a pure-alphabetic token of 3+ chars)
+- **WHEN** the user types `teh ` (space after a pure-alphabetic token of 2+ chars)
 - **THEN** the editor SHALL pass "teh" to the correction engine
 
 #### Scenario: Apostrophe-containing word not corrected

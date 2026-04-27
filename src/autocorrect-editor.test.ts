@@ -257,12 +257,14 @@ describe("AutocorrectEditor", () => {
     expect(engine.shouldCorrect).not.toHaveBeenCalled();
   });
 
-  test("skips short words", () => {
-    const { editor, engine } = createEditor({ is: "was", to: "too" });
+  test("skips single-character words (below min-length-2 threshold)", () => {
+    // Min-length guard is now 2; 1-char tokens are still filtered out.
+    // ("is" and "to" are 2-letter words and are now eligible — see correction-engine tests.)
+    const { editor, engine } = createEditor({ a: "the", i: "in" });
 
-    typeText(editor, "is to ");
+    typeText(editor, "a i ");
 
-    expect(editor.getText()).toBe("is to ");
+    expect(editor.getText()).toBe("a i ");
     expect(engine.shouldCorrect).not.toHaveBeenCalled();
   });
 

@@ -56,10 +56,10 @@ Before the engine is built, the implementation SHALL verify that symspell-ts use
 - **THEN** `lookup("teh", Verbosity.Top, 1)` SHALL return "the" with distance 1, confirming transpositions are counted as a single edit
 
 ### Requirement: Short words are not corrected
-The engine SHALL NOT attempt to correct words shorter than 3 characters, regardless of whether they match any dictionary.
+The engine SHALL NOT attempt to correct words shorter than 2 characters, regardless of whether they match any dictionary.
 
-#### Scenario: Two-character input
-- **WHEN** the user types "fo" or "ty" or any word with fewer than 3 characters
+#### Scenario: One-character input
+- **WHEN** the user types any word with fewer than 2 characters (i.e., a single character)
 - **THEN** the engine SHALL return no correction
 
 ### Requirement: Case preservation on corrections
