@@ -86,6 +86,14 @@ describe("CorrectionEngine", () => {
     expect(engine.shouldCorrect("the")).toEqual({ corrected: false });
   });
 
+  test("corrects distance-2 typos (edit distance 2 required)", () => {
+    // "reccomend" is 2 edits from "recommend" (double-c instead of single, shifted letters);
+    // it would return { corrected: false } at distance 1 — requires distance-2 index + lookup.
+    // Note: the task specified "kuberentes" → "kubernetes", but "kubernetes" is absent from
+    // SymSpell's bundled English frequency dictionary so it cannot be suggested at any distance.
+    expect(engine.shouldCorrect("reccomend")).toEqual({ corrected: true, suggestion: "recommend" });
+  });
+
   test("uses live learned-dictionary lookups without re-initializing", () => {
     const beforeLearning = engine.shouldCorrect("termux");
 

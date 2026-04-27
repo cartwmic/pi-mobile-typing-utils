@@ -28,7 +28,7 @@ export class CorrectionEngine {
     }
 
     try {
-      const symspell = new SymSpell();
+      const symspell = new SymSpell(undefined, 2);
       loadDefaultDictionaries(symspell);
 
       const techDictionaryText = await readFile(this.techDictPath, "utf8");
@@ -60,7 +60,8 @@ export class CorrectionEngine {
     }
 
     const lower = word.toLowerCase();
-    const suggestion = this.symspell.lookup(lower, Verbosity.Top, 1)[0];
+    // edit distance 2: trades broader typo coverage for occasional false positives — tech-dict layer guards known terms
+    const suggestion = this.symspell.lookup(lower, Verbosity.Top, 2)[0];
 
     if (!suggestion) {
       return { corrected: false };
