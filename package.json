@@ -1,0 +1,64 @@
+{
+  "name": "pi-mobile-typing-utils",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "data"
+  ],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "autocorrect",
+    "mobile",
+    "termux"
+  ],
+  "description": "Pi extension(s) for better mobile typing — word-by-word autocorrect for SSH/Termux sessions where Gboard's autocorrect is disabled.",
+  "author": "cartwmic",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cartwmic/pi-mobile-typing-utils.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cartwmic/pi-mobile-typing-utils/issues"
+  },
+  "homepage": "https://github.com/cartwmic/pi-mobile-typing-utils#readme",
+  "pi": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "scripts": {
+    "build": "tsc",
+    "build:dict": "tsx scripts/build-tech-dict.ts",
+    "check:bundle-size": "node scripts/check-bundle-size.mjs",
+    "clean": "rm -rf dist",
+    "dev:install": "npm run build && node -e \"console.log(['Build complete.', '', 'Load directly from the repo root with:', '  pi -e ./dist/index.js', '', 'Or copy the compiled extension for auto-discovery:', '  mkdir -p ~/.pi/agent/extensions/mobile-autocorrect', '  cp -r dist data ~/.pi/agent/extensions/mobile-autocorrect/', '', 'After rebuilding in a running Pi session, use:', '  npm run dev:reload-hint'].join('\\n'))\"",
+    "dev:reload-hint": "node -e \"console.log('Run /reload in your Pi session to reload after rebuild.')\"",
+    "preverify:package": "npm run check:bundle-size",
+    "scenarios": "tests/scenarios/scripts/run-all-scenarios.sh",
+    "scenarios:one": "bash",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "verify:package": "bash scripts/verify-package.sh"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": ">=0.65.0"
+  },
+  "dependencies": {
+    "symspell-ts": "0.0.2"
+  },
+  "devDependencies": {
+    "@cspell/dict-k8s": "1.0.12",
+    "@cspell/dict-node": "5.0.9",
+    "@cspell/dict-python": "4.2.26",
+    "@cspell/dict-software-terms": "5.2.2",
+    "@cspell/dict-typescript": "3.2.3",
+    "tsx": "4.21.0",
+    "typescript": "^5.9.3",
+    "vitest": "4.1.5"
+  }
+}
