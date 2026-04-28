@@ -6,7 +6,7 @@ import { join } from "node:path";
 import type { ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
-import { createTyposCommand } from "./commands.js";
+import { createTyposCommand, prewarmEngine } from "./commands.js";
 import { Config } from "./config.js";
 import { LearnedDictionary } from "./learned-dictionary.js";
 
@@ -58,105 +58,428 @@ describe("createTyposCommand", () => {
     }
   });
 
-  test("serializes /typos on then /typos off during engine initialization", async () => {
-    const dictionary = await createDictionary();
-    const initializeDeferred = createDeferred<void>();
+  // ---------------------------------------------------------------------------
+  // Section 5: Lazy/non-blocking initialization tests (5.7.1 – 5.7.7)
+  // ---------------------------------------------------------------------------
+
+  // Helper: build a minimal fake engine with controllable readiness state
+  function makeFakeEngine(
+    initDeferred: { promise: Promise<void>; resolve: () => void; reject: (e: unknown) => void },
+    readinessOverride?: "building" | "ready" | "degraded",
+  ) {
+    let readiness: "building" | "ready" | "degraded" = "building";
     const initialize = vi.fn(async () => {
-      await initializeDeferred.promise;
+      try {
+        await initDeferred.promise;
+        readiness = "ready";
+      } catch (err) {
+        readiness = "degraded";
+        throw err;
+      }
+    });
+    return {
+      initialize,
+      getReadinessState: () => readinessOverride ?? readiness,
+      getLastInitError: () => undefined,
+    };
+  }
+
+  // 5.7.1: /typos on returns immediately; editor installed before init resolves
+  test("5.7.1: /typos on returns within a few ms and installs editor before init resolves", async () => {
+    const dictionary = await createDictionary();
+    const initDeferred = createDeferred<void>();
+    const fakeEngine = makeFakeEngine(initDeferred);
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
+      createCorrectionEngine: () => fakeEngine as never,
+      createAutocorrectEditor: (() => ({}) as never) as never,
+    });
+    const ctx = createCommandContext();
+
+    const start = Date.now();
+    await command.handler("on", ctx);
+    const elapsed = Date.now() - start;
+
+    // Returns well before any real init (mocked deferred still pending).
+    expect(elapsed).toBeLessThan(200);
+    // Editor installed immediately, even before init resolves.
+    expect(ctx.setEditorComponentCalls.at(-1)).toEqual(expect.any(Function));
+    expect(command.state.enabled).toBe(true);
+    // Persistent indicator shows loading.
+    expect(ctx.statusUpdates).toContainEqual({ key: "typos", value: "Autocorrect loading…" });
+    // Notification says loading.
+    expect(ctx.notifications.at(-1)).toEqual({ message: "Autocorrect ON (loading…)", level: "info" });
+    // Init is still pending.
+    expect(fakeEngine.initialize).toHaveBeenCalledTimes(1);
+    // Cleanup: resolve so the unhandled promise doesn't linger.
+    initDeferred.resolve();
+    await Promise.resolve();
+  });
+
+  // 5.7.2: /typos off while init pending — orphaned init callbacks are no-ops
+  test("5.7.2: /typos off while init is pending does not trigger UI updates from orphaned init", async () => {
+    const dictionary = await createDictionary();
+    const initDeferred = createDeferred<void>();
+    const fakeEngine = makeFakeEngine(initDeferred);
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
+      createCorrectionEngine: () => fakeEngine as never,
+      createAutocorrectEditor: (() => ({}) as never) as never,
+    });
+    const ctx = createCommandContext();
+
+    // Enable — non-blocking, editor installed immediately.
+    await command.handler("on", ctx);
+    expect(command.state.enabled).toBe(true);
+    const genAfterEnable = command.state.generation;
+
+    // Disable while init is still pending.
+    await command.handler("off", ctx);
+    expect(command.state.enabled).toBe(false);
+    expect(command.state.generation).toBeGreaterThan(genAfterEnable); // gen bumped
+    expect(ctx.setEditorComponentCalls.at(-1)).toBeUndefined(); // editor removed
+    expect(ctx.statusUpdates.at(-1)).toEqual({ key: "typos", value: undefined }); // status cleared
+    expect(ctx.notifications.at(-1)).toEqual({ message: "Autocorrect OFF", level: "info" });
+
+    // Record notification count before the orphaned init resolves.
+    const notificationsCountBefore = ctx.notifications.length;
+    const statusCountBefore = ctx.statusUpdates.length;
+
+    // Resolve the now-orphaned init promise.
+    initDeferred.resolve();
+    await Promise.resolve();
+    await Promise.resolve(); // flush any chained microtasks
+
+    // Orphan guard: no new UI side effects.
+    expect(ctx.notifications).toHaveLength(notificationsCountBefore);
+    expect(ctx.statusUpdates).toHaveLength(statusCountBefore);
+    // Engine and initInFlight remain dropped.
+    expect(command.state.engine).toBeUndefined();
+    expect(command.state.initInFlight).toBeUndefined();
+  });
+
+  // 5.7.3: Double /typos on does not start a second build
+  test("5.7.3: double /typos on does not start a second build", async () => {
+    const dictionary = await createDictionary();
+    const initDeferred = createDeferred<void>();
+    const fakeEngine = makeFakeEngine(initDeferred);
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
+      createCorrectionEngine: () => fakeEngine as never,
+      createAutocorrectEditor: (() => ({}) as never) as never,
+    });
+    const ctx = createCommandContext();
+
+    // First enable — starts the build.
+    await command.handler("on", ctx);
+    expect(fakeEngine.initialize).toHaveBeenCalledTimes(1);
+    expect(command.state.enabled).toBe(true);
+
+    // Second enable — already enabled, should emit "already on" and NOT start a second init.
+    await command.handler("on", ctx);
+    expect(fakeEngine.initialize).toHaveBeenCalledTimes(1); // still only one call
+    expect(ctx.notifications.filter((n) => n.message === "Autocorrect is already on")).toHaveLength(1);
+    expect(ctx.notifications.filter((n) => n.message === "Autocorrect ON (loading…)")).toHaveLength(1); // only from first enable
+
+    // Cleanup.
+    initDeferred.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  // 5.7.4: maxEditDistance change during in-flight init is non-blocking; prior init orphaned
+  test("5.7.4: maxEditDistance config change during in-flight init orphans the prior init callbacks", async () => {
+    const dictionary = await createDictionary();
+    const firstInitDeferred = createDeferred<void>();
+    const secondInitDeferred = createDeferred<void>();
+    let callCount = 0;
+    const initialize = vi.fn(async () => {
+      const n = ++callCount;
+      if (n === 1) {
+        await firstInitDeferred.promise;
+      } else {
+        await secondInitDeferred.promise;
+      }
+    });
+    const getReadinessState = () => "building" as const;
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
+      createCorrectionEngine: () => ({ initialize, getReadinessState } as never),
+      createAutocorrectEditor: (() => ({}) as never) as never,
+    });
+    const ctx = createCommandContext();
+
+    // Start the first enable (init in flight).
+    await command.handler("on", ctx);
+    expect(initialize).toHaveBeenCalledTimes(1);
+    const genAfterEnable = command.state.generation;
+
+    // Change maxEditDistance while first init is still pending — must return quickly.
+    const start = Date.now();
+    await command.handler("config maxEditDistance 3", ctx);
+    expect(Date.now() - start).toBeLessThan(200);
+
+    // Generation bumped — first init is now orphaned.
+    expect(command.state.generation).toBeGreaterThan(genAfterEnable);
+    // A fresh init was started for the new engine.
+    expect(initialize).toHaveBeenCalledTimes(2);
+    // Notification: only the config-change message, no "Autocorrect ON/OFF".
+    expect(ctx.notifications.at(-1)).toEqual({ message: "maxEditDistance set to 3", level: "info" });
+
+    const notificationsCountBefore = ctx.notifications.length;
+    const statusCountBefore = ctx.statusUpdates.length;
+
+    // Resolve the first (orphaned) init — must produce zero UI side effects.
+    firstInitDeferred.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(ctx.notifications).toHaveLength(notificationsCountBefore);
+    expect(ctx.statusUpdates).toHaveLength(statusCountBefore);
+
+    // Resolve the second (live) init — status should update.
+    secondInitDeferred.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(ctx.statusUpdates.at(-1)).toEqual({ key: "typos", value: "✓ Autocorrect" });
+  });
+
+  // 5.7.5: maxEditDistance < minEditDistance is rejected with actionable error
+  test("5.7.5: /typos config maxEditDistance where n < minEditDistance is rejected before persisting", async () => {
+    const dictionary = await createDictionary();
+    const cfg = createConfig();
+    // Set minEditDistance to 2 (default maxEditDistance is 2, so this is valid).
+    await cfg.setMinEditDistance(2);
+    expect(cfg.getMinEditDistance()).toBe(2);
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config: cfg,
+    });
+    const ctx = createCommandContext();
+
+    // Try to set maxEditDistance to 1 (less than minEditDistance=2).
+    await command.handler("config maxEditDistance 1", ctx);
+
+    expect(ctx.notifications.at(-1)).toEqual({
+      message: "maxEditDistance cannot be less than current minEditDistance (2); change minEditDistance first",
+      level: "warning",
+    });
+    // Config must NOT have been mutated.
+    expect(cfg.getMaxEditDistance()).toBe(2);
+  });
+
+  // 5.7.6: /typos on while degraded and disabled discards old engine and rebuilds fresh
+  test("5.7.6: /typos on while engine is degraded and disabled discards old engine and rebuilds fresh", async () => {
+    const dictionary = await createDictionary();
+    const freshInitDeferred = createDeferred<void>();
+    const freshInitialize = vi.fn(async () => {
+      await freshInitDeferred.promise;
     });
 
     const command = createTyposCommand({
       learnedDictionary: dictionary,
       techDictPath: "/tmp/tech-dict.txt",
       config: createConfig(),
-      createCorrectionEngine: () => ({ initialize } as never),
+      createCorrectionEngine: () =>
+        ({ initialize: freshInitialize, getReadinessState: () => "building" as const } as never),
       createAutocorrectEditor: (() => ({}) as never) as never,
     });
     const ctx = createCommandContext();
 
-    const enablePromise = command.handler("on", ctx);
-    await vi.waitFor(() => {
-      expect(initialize).toHaveBeenCalledTimes(1);
+    // Manually seed a degraded engine (simulates a failed pre-warm).
+    const degradedEngine = {
+      getReadinessState: () => "degraded" as const,
+      getLastInitError: () => new Error("prior failure"),
+      initialize: vi.fn(),
+    };
+    command.state.engine = degradedEngine as never;
+
+    const genBefore = command.state.generation;
+
+    // /typos on while degraded and disabled: should discard degraded engine and build fresh.
+    await command.handler("on", ctx);
+
+    // Generation bumped (orphans any stale callbacks from the degraded engine).
+    expect(command.state.generation).toBeGreaterThan(genBefore);
+    // Degraded engine initialize must NOT have been called again.
+    expect(degradedEngine.initialize).not.toHaveBeenCalled();
+    // Fresh engine was constructed and its init was started.
+    expect(freshInitialize).toHaveBeenCalledTimes(1);
+    // Editor installed and state is enabled.
+    expect(command.state.enabled).toBe(true);
+    expect(ctx.setEditorComponentCalls.at(-1)).toEqual(expect.any(Function));
+    // Status reflects building state.
+    expect(ctx.statusUpdates).toContainEqual({ key: "typos", value: "Autocorrect loading…" });
+
+    // Cleanup.
+    freshInitDeferred.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  // 5.7.7: Engine init failure surfaces degraded notification and status
+  test("5.7.7: engine init failure surfaces degraded notification and sets status to unavailable", async () => {
+    const dictionary = await createDictionary();
+    const initDeferred = createDeferred<void>();
+    const initError = new Error("dictionary load failed");
+    const fakeEngine = makeFakeEngine(initDeferred);
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
+      createCorrectionEngine: () => fakeEngine as never,
+      createAutocorrectEditor: (() => ({}) as never) as never,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("on", ctx);
+    expect(command.state.enabled).toBe(true);
+
+    // Reject the init promise to simulate failure.
+    initDeferred.reject(initError);
+    await Promise.resolve();
+    await Promise.resolve(); // flush chained microtasks
+
+    // Status updated to "unavailable".
+    expect(ctx.statusUpdates).toContainEqual({ key: "typos", value: "Autocorrect unavailable" });
+    // Error notification surfaced.
+    expect(ctx.notifications).toContainEqual({
+      message: "Autocorrect initialization failed: dictionary load failed",
+      level: "error",
+    });
+    // Editor remains installed (engine still in degraded state, corrections silently no-op).
+    expect(ctx.setEditorComponentCalls.at(-1)).toEqual(expect.any(Function));
+  });
+
+  // ---------------------------------------------------------------------------
+  // Legacy toggle serialization tests (updated for non-blocking design)
+  // ---------------------------------------------------------------------------
+
+  test("legacy: /typos on then /typos off — orphaned init callback is a no-op", async () => {
+    const dictionary = await createDictionary();
+    const initDeferred = createDeferred<void>();
+    const initialize = vi.fn(async () => {
+      await initDeferred.promise;
     });
 
-    expect(command.state.enabled).toBe(false);
-    expect(ctx.statusUpdates).toContainEqual({ key: "typos-loading", value: "Loading autocorrect..." });
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
+      createCorrectionEngine: () => ({ initialize, getReadinessState: () => "building" as const } as never),
+      createAutocorrectEditor: (() => ({}) as never) as never,
+    });
+    const ctx = createCommandContext();
 
-    const disablePromise = command.handler("off", ctx);
+    // Enable is now non-blocking: returns after editor is installed.
+    const enablePromise = command.handler("on", ctx);
+    await enablePromise;
+
+    // Editor installed, state enabled, init still pending.
+    expect(command.state.enabled).toBe(true);
+    expect(ctx.setEditorComponentCalls[0]).toEqual(expect.any(Function));
+    expect(ctx.statusUpdates).toContainEqual({ key: "typos", value: "Autocorrect loading…" });
+
+    // Disable while init is pending.
+    const genAfterEnable = command.state.generation;
+    await command.handler("off", ctx);
+    expect(command.state.enabled).toBe(false);
+    expect(command.state.generation).toBeGreaterThan(genAfterEnable);
+
+    // Resolve the now-orphaned init.
+    initDeferred.resolve();
+    await Promise.resolve();
     await Promise.resolve();
 
-    initializeDeferred.resolve();
-    await Promise.all([enablePromise, disablePromise]);
-
+    // Engine was dropped by disable; orphaned callbacks are no-ops.
     expect(initialize).toHaveBeenCalledTimes(1);
     expect(command.state.enabled).toBe(false);
-    expect(ctx.setEditorComponentCalls[0]).toEqual(expect.any(Function));
-    expect(ctx.setEditorComponentCalls.at(-1)).toBeUndefined();
-    expect(ctx.statusUpdates).toContainEqual({ key: "typos-loading", value: undefined });
-    expect(ctx.statusUpdates).toContainEqual({ key: "typos", value: "✓ Autocorrect" });
+    expect(ctx.setEditorComponentCalls.at(-1)).toBeUndefined(); // editor removed
+    // "✓ Autocorrect" must NOT appear (orphan guard blocked it).
+    expect(ctx.statusUpdates.map((s) => s.value)).not.toContain("✓ Autocorrect");
     expect(ctx.statusUpdates).toContainEqual({ key: "typos", value: undefined });
     expect(ctx.notifications.at(-1)).toEqual({ message: "Autocorrect OFF", level: "info" });
   });
 
-  test("coalesces duplicate /typos on requests while loading", async () => {
+  test("legacy: double /typos on emits \"Autocorrect is already on\" and starts no second init", async () => {
     const dictionary = await createDictionary();
-    const initializeDeferred = createDeferred<void>();
+    const initDeferred = createDeferred<void>();
     const initialize = vi.fn(async () => {
-      await initializeDeferred.promise;
+      await initDeferred.promise;
     });
 
     const command = createTyposCommand({
       learnedDictionary: dictionary,
       techDictPath: "/tmp/tech-dict.txt",
       config: createConfig(),
-      createCorrectionEngine: () => ({ initialize } as never),
+      createCorrectionEngine: () => ({ initialize, getReadinessState: () => "building" as const } as never),
       createAutocorrectEditor: (() => ({}) as never) as never,
     });
     const ctx = createCommandContext();
 
-    const firstEnable = command.handler("on", ctx);
-    await vi.waitFor(() => {
-      expect(initialize).toHaveBeenCalledTimes(1);
-    });
-
-    const secondEnable = command.handler("on", ctx);
-    await Promise.resolve();
-
-    initializeDeferred.resolve();
-    await Promise.all([firstEnable, secondEnable]);
-
+    // First enable — returns immediately after installing editor.
+    await command.handler("on", ctx);
     expect(initialize).toHaveBeenCalledTimes(1);
     expect(command.state.enabled).toBe(true);
-    expect(ctx.notifications.filter((entry) => entry.message === "Autocorrect ON")).toHaveLength(1);
-    expect(ctx.notifications.map((entry) => entry.message)).not.toContain("Autocorrect is already on");
+
+    // Second enable — must NOT start a second init.
+    await command.handler("on", ctx);
+    expect(initialize).toHaveBeenCalledTimes(1);
+    expect(command.state.enabled).toBe(true);
+    // Per spec "Double enable during initialization": emits "already on".
+    expect(ctx.notifications.filter((n) => n.message === "Autocorrect is already on")).toHaveLength(1);
+    // Only one "Autocorrect ON (loading…)" from the first enable.
+    expect(ctx.notifications.filter((n) => n.message === "Autocorrect ON (loading…)")).toHaveLength(1);
+
+    // Cleanup.
+    initDeferred.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
   });
 
-  test("treats a second bare /typos during load as a queued toggle", async () => {
+  test("legacy: second bare /typos during load toggle sequence ends with autocorrect OFF", async () => {
     const dictionary = await createDictionary();
-    const initializeDeferred = createDeferred<void>();
+    const initDeferred = createDeferred<void>();
     const initialize = vi.fn(async () => {
-      await initializeDeferred.promise;
+      await initDeferred.promise;
     });
 
     const command = createTyposCommand({
       learnedDictionary: dictionary,
       techDictPath: "/tmp/tech-dict.txt",
       config: createConfig(),
-      createCorrectionEngine: () => ({ initialize } as never),
+      createCorrectionEngine: () => ({ initialize, getReadinessState: () => "building" as const } as never),
       createAutocorrectEditor: (() => ({}) as never) as never,
     });
     const ctx = createCommandContext();
 
-    const firstToggle = command.handler("", ctx);
-    await vi.waitFor(() => {
-      expect(initialize).toHaveBeenCalledTimes(1);
-    });
+    // First bare /typos → enable (non-blocking).
+    await command.handler("", ctx);
+    expect(command.state.enabled).toBe(true);
+    expect(initialize).toHaveBeenCalledTimes(1);
 
-    const secondToggle = command.handler("   ", ctx);
+    // Second bare /typos → disable (sees enabled=true, goes to disable).
+    await command.handler("   ", ctx);
+    expect(command.state.enabled).toBe(false);
+
+    // Resolve the orphaned init.
+    initDeferred.resolve();
     await Promise.resolve();
-
-    initializeDeferred.resolve();
-    await Promise.all([firstToggle, secondToggle]);
+    await Promise.resolve();
 
     expect(initialize).toHaveBeenCalledTimes(1);
     expect(command.state.enabled).toBe(false);
@@ -540,7 +863,7 @@ describe("createTyposCommand", () => {
       learnedDictionary: dictionary,
       techDictPath: "/tmp/tech-dict.txt",
       config,
-      createCorrectionEngine: () => ({ initialize } as never),
+      createCorrectionEngine: () => ({ initialize, getReadinessState: () => "building" as const } as never),
       createAutocorrectEditor: (() => ({}) as never) as never,
     });
     const ctx = createCommandContext();
@@ -549,7 +872,9 @@ describe("createTyposCommand", () => {
 
     expect(command.state.enabled).toBe(true);
     expect(initialize).toHaveBeenCalledTimes(1);
-    expect(ctx.notifications.at(-1)).toEqual({ message: "Autocorrect ON", level: "info" });
+    // With non-blocking init, the notification is "loading…" since the engine
+    // hasn't reached ready state synchronously.
+    expect(ctx.notifications).toContainEqual({ message: "Autocorrect ON (loading…)", level: "info" });
   });
 
   test("applyDefaultMode is a silent no-op when state already matches default", async () => {
@@ -584,7 +909,7 @@ describe("createTyposCommand", () => {
       learnedDictionary: dictionary,
       techDictPath: "/tmp/tech-dict.txt",
       config,
-      createCorrectionEngine: () => ({ initialize } as never),
+      createCorrectionEngine: () => ({ initialize, getReadinessState: () => "building" as const } as never),
       createAutocorrectEditor: (() => ({}) as never) as never,
     });
     const ctx = createCommandContext();
@@ -614,7 +939,7 @@ describe("createTyposCommand", () => {
     const message = ctx.notifications.at(-1)?.message ?? "";
     expect(message.startsWith("Mobile autocorrect config:")).toBe(true);
     expect(message).toMatch(/defaultMode\s+off/);
-    expect(message).toMatch(/maxEditDistance\s+2\s+\(range 1-3\)/);
+    expect(message).toMatch(/maxEditDistance\s+2\s+\(range 1-4\)/);
     expect(message).toMatch(/minWordLength\s+2\s+\(range 2-8\)/);
   });
 
@@ -631,7 +956,7 @@ describe("createTyposCommand", () => {
     await command.handler("config maxEditDistance", ctx);
 
     expect(ctx.notifications.at(-1)).toEqual({
-      message: "maxEditDistance = 2 (range 1-3)",
+      message: "maxEditDistance = 2 (range 1-4)",
       level: "info",
     });
   });
@@ -649,7 +974,7 @@ describe("createTyposCommand", () => {
     await command.handler("config wibble 5", ctx);
 
     expect(ctx.notifications.at(-1)).toEqual({
-      message: "Usage: /typos config [defaultMode|maxEditDistance|minWordLength] [<value>]",
+      message: "Usage: /typos config [defaultMode|maxEditDistance|minWordLength|minEditDistance|editDistanceStepEvery] [<value>]",
       level: "warning",
     });
   });
@@ -684,16 +1009,16 @@ describe("createTyposCommand", () => {
     const ctx = createCommandContext();
 
     await command.handler("config maxEditDistance 0", ctx);
-    await command.handler("config maxEditDistance 4", ctx);
+    await command.handler("config maxEditDistance 5", ctx);
     await command.handler("config maxEditDistance two", ctx);
     await command.handler("config maxEditDistance 1.5", ctx);
 
     expect(config.getMaxEditDistance()).toBe(2); // unchanged
     expect(ctx.notifications.map((n) => n.message)).toEqual([
-      "Usage: /typos config maxEditDistance <integer 1-3>",
-      "Usage: /typos config maxEditDistance <integer 1-3>",
-      "Usage: /typos config maxEditDistance <integer 1-3>",
-      "Usage: /typos config maxEditDistance <integer 1-3>",
+      "Usage: /typos config maxEditDistance <integer 1-4>",
+      "Usage: /typos config maxEditDistance <integer 1-4>",
+      "Usage: /typos config maxEditDistance <integer 1-4>",
+      "Usage: /typos config maxEditDistance <integer 1-4>",
     ]);
   });
 
@@ -701,7 +1026,7 @@ describe("createTyposCommand", () => {
     const dictionary = await createDictionary();
     const config = createConfig();
     const initialize = vi.fn(async () => undefined);
-    const createCorrectionEngine = vi.fn(() => ({ initialize } as never));
+    const createCorrectionEngine = vi.fn(() => ({ initialize, getReadinessState: () => "building" as const } as never));
     const command = createTyposCommand({
       learnedDictionary: dictionary,
       techDictPath: "/tmp/tech-dict.txt",
@@ -731,7 +1056,7 @@ describe("createTyposCommand", () => {
     const dictionary = await createDictionary();
     const config = createConfig();
     const initialize = vi.fn(async () => undefined);
-    const createCorrectionEngine = vi.fn(() => ({ initialize } as never));
+    const createCorrectionEngine = vi.fn(() => ({ initialize, getReadinessState: () => "building" as const } as never));
     const command = createTyposCommand({
       learnedDictionary: dictionary,
       techDictPath: "/tmp/tech-dict.txt",
@@ -760,6 +1085,7 @@ describe("createTyposCommand", () => {
     const createCorrectionEngine = vi.fn((opts: { getMinWordLength?: () => number }) => ({
       initialize,
       getMinWordLengthRef: opts.getMinWordLength,
+      getReadinessState: () => "building" as const,
     }) as never);
     const command = createTyposCommand({
       learnedDictionary: dictionary,
@@ -845,6 +1171,503 @@ describe("createTyposCommand", () => {
     const partialItems = command.getArgumentCompletions("config minWordLength 3");
     expect(partialItems?.map((item) => item.label)).toEqual(["3"]);
     expect(partialItems?.[0]?.value).toBe("config minWordLength 3");
+  });
+
+  // ---------------------------------------------------------------------------
+  // Section 6.10 — new config keys, indicator values, completions
+  // ---------------------------------------------------------------------------
+
+  test("6.10: /typos config lists minEditDistance and editDistanceStepEvery in bare listing", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("config", ctx);
+
+    const message = ctx.notifications.at(-1)?.message ?? "";
+    expect(message.startsWith("Mobile autocorrect config:")).toBe(true);
+    // Existing keys still present.
+    expect(message).toMatch(/defaultMode\s+off/);
+    expect(message).toMatch(/maxEditDistance\s+2\s+\(range 1-4\)/);
+    expect(message).toMatch(/minWordLength\s+2\s+\(range 2-8\)/);
+    // New keys with correct dynamic ranges (maxED=2 so minED upper bound is 2).
+    expect(message).toMatch(/minEditDistance\s+1\s+\(range 0-2\)/);
+    expect(message).toMatch(/editDistanceStepEvery\s+4\s+\(range 1-8\)/);
+  });
+
+  test("6.10: /typos config minEditDistance shows single-key display", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("config minEditDistance", ctx);
+
+    expect(ctx.notifications.at(-1)).toEqual({
+      message: "minEditDistance = 1 (range 0-2)",
+      level: "info",
+    });
+  });
+
+  test("6.10: /typos config editDistanceStepEvery shows single-key display", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("config editDistanceStepEvery", ctx);
+
+    expect(ctx.notifications.at(-1)).toEqual({
+      message: "editDistanceStepEvery = 4 (range 1-8)",
+      level: "info",
+    });
+  });
+
+  test("6.10: /typos config minEditDistance SET success paths (0, 1, 2 when maxED=2)", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    expect(config.getMaxEditDistance()).toBe(2);
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    // 0 — valid floor
+    await command.handler("config minEditDistance 0", ctx);
+    expect(config.getMinEditDistance()).toBe(0);
+    expect(ctx.notifications.at(-1)).toEqual({ message: "minEditDistance set to 0", level: "info" });
+
+    // 1 — default, but since we changed to 0 first it's now a change back
+    await command.handler("config minEditDistance 1", ctx);
+    expect(config.getMinEditDistance()).toBe(1);
+    expect(ctx.notifications.at(-1)).toEqual({ message: "minEditDistance set to 1", level: "info" });
+
+    // 2 — valid upper bound (equals current maxED)
+    await command.handler("config minEditDistance 2", ctx);
+    expect(config.getMinEditDistance()).toBe(2);
+    expect(ctx.notifications.at(-1)).toEqual({ message: "minEditDistance set to 2", level: "info" });
+  });
+
+  test("6.10: /typos config editDistanceStepEvery SET success paths (4, 8)", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("config editDistanceStepEvery 4", ctx);
+    expect(ctx.notifications.at(-1)).toEqual({ message: "editDistanceStepEvery is already 4", level: "info" });
+
+    await command.handler("config editDistanceStepEvery 8", ctx);
+    expect(config.getEditDistanceStepEvery()).toBe(8);
+    expect(ctx.notifications.at(-1)).toEqual({ message: "editDistanceStepEvery set to 8", level: "info" });
+
+    await command.handler("config editDistanceStepEvery 1", ctx);
+    expect(config.getEditDistanceStepEvery()).toBe(1);
+    expect(ctx.notifications.at(-1)).toEqual({ message: "editDistanceStepEvery set to 1", level: "info" });
+  });
+
+  test("6.10: /typos config minEditDistance rejects -1 (out of range)", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("config minEditDistance -1", ctx);
+
+    expect(config.getMinEditDistance()).toBe(1); // unchanged
+    expect(ctx.notifications.at(-1)).toEqual({
+      message: "Usage: /typos config minEditDistance <integer 0-2>",
+      level: "warning",
+    });
+  });
+
+  test("6.10: /typos config minEditDistance 3 when maxEditDistance=2 is rejected with actionable error", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    expect(config.getMaxEditDistance()).toBe(2);
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("config minEditDistance 3", ctx);
+
+    expect(config.getMinEditDistance()).toBe(1); // unchanged
+    expect(ctx.notifications.at(-1)).toEqual({
+      message: "Usage: /typos config minEditDistance <integer 0-2>",
+      level: "warning",
+    });
+  });
+
+  test("6.10: /typos config minEditDistance abc rejects non-integer", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("config minEditDistance abc", ctx);
+
+    expect(config.getMinEditDistance()).toBe(1); // unchanged
+    expect(ctx.notifications.at(-1)).toEqual({
+      message: "Usage: /typos config minEditDistance <integer 0-2>",
+      level: "warning",
+    });
+  });
+
+  test("6.10: /typos config editDistanceStepEvery rejects 0 and 9 (out of range)", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("config editDistanceStepEvery 0", ctx);
+    await command.handler("config editDistanceStepEvery 9", ctx);
+
+    expect(config.getEditDistanceStepEvery()).toBe(4); // unchanged
+    expect(ctx.notifications.map((n) => n.message)).toEqual([
+      "Usage: /typos config editDistanceStepEvery <integer 1-8>",
+      "Usage: /typos config editDistanceStepEvery <integer 1-8>",
+    ]);
+  });
+
+  test("6.10: completion suggestions for maxEditDistance use dynamic lower bound from minEditDistance", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+
+    // Default minEditDistance = 1: suggestions start at 1.
+    const defaultCompletions = command.getArgumentCompletions("config maxEditDistance ");
+    expect(defaultCompletions?.map((item) => item.label)).toEqual(["1", "2", "3", "4"]);
+
+    // Set minEditDistance = 2: suggestions start at 2.
+    await config.setMinEditDistance(2);
+    const shiftedCompletions = command.getArgumentCompletions("config maxEditDistance ");
+    expect(shiftedCompletions?.map((item) => item.label)).toEqual(["2", "3", "4"]);
+
+    // Set minEditDistance = 0: suggestions start at 0.
+    await config.setMinEditDistance(0);
+    const zeroCompletions = command.getArgumentCompletions("config maxEditDistance ");
+    expect(zeroCompletions?.map((item) => item.label)).toEqual(["0", "1", "2", "3", "4"]);
+  });
+
+  test("6.10: completion suggestions for minEditDistance use dynamic upper bound from maxEditDistance", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    // Default maxEditDistance = 2: upper bound is 2.
+    await config.setMinEditDistance(0); // lower bound always 0
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+
+    const completions = command.getArgumentCompletions("config minEditDistance ");
+    expect(completions?.map((item) => item.label)).toEqual(["0", "1", "2"]);
+
+    // After raising maxEditDistance to 4 the upper bound expands.
+    await config.setMaxEditDistance(4);
+    const expandedCompletions = command.getArgumentCompletions("config minEditDistance ");
+    expect(expandedCompletions?.map((item) => item.label)).toEqual(["0", "1", "2", "3", "4"]);
+  });
+
+  test("6.10: completion suggestions for editDistanceStepEvery are fixed 1-8", async () => {
+    const dictionary = await createDictionary();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
+    });
+
+    const completions = command.getArgumentCompletions("config editDistanceStepEvery ");
+    expect(completions?.map((item) => item.label)).toEqual(["1", "2", "3", "4", "5", "6", "7", "8"]);
+    // Value includes the parent path per Pi's applyCompletion contract.
+    expect(completions?.[0]?.value).toBe("config editDistanceStepEvery 1");
+  });
+
+  test("6.10: minEditDistance and editDistanceStepEvery appear in second-level config key completions", async () => {
+    const dictionary = await createDictionary();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
+    });
+
+    const completions = command.getArgumentCompletions("config ");
+    const labels = completions?.map((item) => item.label);
+    expect(labels).toContain("minEditDistance");
+    expect(labels).toContain("editDistanceStepEvery");
+    // Values must include the parent token for Pi's applyCompletion.
+    const minEdItem = completions?.find((item) => item.label === "minEditDistance");
+    expect(minEdItem?.value).toBe("config minEditDistance");
+  });
+
+  test("6.10: setStatus('typos-loading', ...) is never called from any code path", async () => {
+    const dictionary = await createDictionary();
+    const initDeferred = createDeferred<void>();
+    const fakeEngine = makeFakeEngine(initDeferred);
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
+      createCorrectionEngine: () => fakeEngine as never,
+      createAutocorrectEditor: (() => ({}) as never) as never,
+    });
+    const ctx = createCommandContext();
+
+    // Enable (triggers background init → loading state).
+    await command.handler("on", ctx);
+    // Disable (clears status).
+    await command.handler("off", ctx);
+    // Resolve orphaned init.
+    initDeferred.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // None of the status updates should use the deprecated "typos-loading" key.
+    const typosLoadingCalls = ctx.statusUpdates.filter((s) => s.key === "typos-loading");
+    expect(typosLoadingCalls).toHaveLength(0);
+    // All calls should use "typos".
+    const typosCalls = ctx.statusUpdates.filter((s) => s.key === "typos");
+    expect(typosCalls.length).toBeGreaterThan(0);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Section 7.4 — Pre-warm tests
+  // ---------------------------------------------------------------------------
+
+  // 7.4.1: prewarmEngine schedules init; createTyposCommand seeds state
+  test("7.4.1: prewarmEngine seeds state.engine and state.initInFlight for later reuse", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    await config.setDefaultMode("on");
+
+    const initDeferred = createDeferred<void>();
+    const initialize = vi.fn(async () => {
+      await initDeferred.promise;
+    });
+    const fakeEngineForPrewarm = {
+      initialize,
+      getReadinessState: () => "building" as const,
+      getLastInitError: () => undefined,
+    };
+
+    const prewarm = prewarmEngine({
+      techDictPath: "/tmp/tech-dict.txt",
+      learnedDictionary: dictionary,
+      config,
+      createCorrectionEngine: () => fakeEngineForPrewarm as never,
+    });
+
+    // initialize() was called once during prewarm
+    expect(initialize).toHaveBeenCalledTimes(1);
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+      prewarm,
+      createAutocorrectEditor: (() => ({}) as never) as never,
+    });
+
+    // State is seeded without calling enable() yet
+    expect(command.state.engine).toBe(fakeEngineForPrewarm);
+    expect(command.state.initInFlight).toBe(prewarm.initPromise);
+    expect(command.state.enabled).toBe(false);
+
+    // Cleanup
+    initDeferred.resolve();
+    await Promise.resolve();
+  });
+
+  // 7.4.2: No prewarm when defaultMode is off
+  test("7.4.2: when prewarm is omitted, state.engine and state.initInFlight start undefined", () => {
+    const dictionary = new LearnedDictionary({ filePath: "/tmp/nonexistent.json" });
+    const config = new Config({ filePath: "/tmp/nonexistent-config.json" });
+    // defaultMode is "off" (the default bootstrap value).
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+      // prewarm omitted intentionally
+    });
+
+    expect(command.state.engine).toBeUndefined();
+    expect(command.state.initInFlight).toBeUndefined();
+    expect(command.state.enabled).toBe(false);
+  });
+
+  // 7.4.3: Pre-warm hit — engine already ready → "Autocorrect ON" (no loading suffix)
+  test("7.4.3: enable() reuses a pre-warmed engine that is already ready → 'Autocorrect ON'", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+
+    const initialize = vi.fn(async () => undefined);
+    const readyEngine = {
+      initialize,
+      getReadinessState: () => "ready" as const,
+      getLastInitError: () => undefined,
+    };
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+      prewarm: { engine: readyEngine as never, initPromise: Promise.resolve() },
+      createAutocorrectEditor: (() => ({}) as never) as never,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("on", ctx);
+
+    // No second initialize call — the pre-warm already ran it.
+    expect(initialize).not.toHaveBeenCalled();
+    expect(command.state.enabled).toBe(true);
+    // "Autocorrect ON" without loading suffix (pre-warm hit).
+    expect(ctx.notifications.at(-1)).toEqual({ message: "Autocorrect ON", level: "info" });
+    // Status immediately shows ready.
+    expect(ctx.statusUpdates.at(-1)).toEqual({ key: "typos", value: "\u2713 Autocorrect" });
+  });
+
+  // 7.4.4: Pre-warm in flight — enable() reuses engine + promise → only one initialize call
+  test("7.4.4: enable() reuses a pre-warmed in-flight engine → only one initialize call total", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+
+    const initDeferred = createDeferred<void>();
+    const initialize = vi.fn(async () => {
+      await initDeferred.promise;
+    });
+    const buildingEngine = {
+      initialize,
+      getReadinessState: () => "building" as const,
+      getLastInitError: () => undefined,
+    };
+
+    // Simulate: prewarmEngine already called initialize() once and returned the promise.
+    const initPromise = buildingEngine.initialize();
+    expect(initialize).toHaveBeenCalledTimes(1);
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+      prewarm: { engine: buildingEngine as never, initPromise },
+      createAutocorrectEditor: (() => ({}) as never) as never,
+    });
+    const ctx = createCommandContext();
+
+    // enable() should attach to the existing in-flight promise, not start a second init.
+    await command.handler("on", ctx);
+
+    // Still only one initialize call (from the simulated pre-warm).
+    expect(initialize).toHaveBeenCalledTimes(1);
+    expect(command.state.engine).toBe(buildingEngine);
+    expect(command.state.initInFlight).toBe(initPromise);
+    expect(command.state.enabled).toBe(true);
+    expect(ctx.notifications.at(-1)).toEqual({ message: "Autocorrect ON (loading\u2026)", level: "info" });
+    expect(ctx.statusUpdates).toContainEqual({ key: "typos", value: "Autocorrect loading\u2026" });
+
+    // Resolve the pre-warm promise — status should update to ready.
+    initDeferred.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(ctx.statusUpdates.at(-1)).toEqual({ key: "typos", value: "\u2713 Autocorrect" });
+  });
+
+  // 7.4.5: Pre-warm failure → degraded → first enable() discards and retries fresh
+  test("7.4.5: pre-warm failure leaves engine degraded; first enable() discards and rebuilds fresh", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+
+    const freshInitDeferred = createDeferred<void>();
+    const freshInitialize = vi.fn(async () => {
+      await freshInitDeferred.promise;
+    });
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+      // Seed a degraded engine as if prewarmEngine failed before enable() ran.
+      // Attach .catch() to suppress the unhandled-rejection warning — mirroring
+      // what prewarmEngine() does internally before returning the handle.
+      prewarm: (() => {
+        const failedInit = Promise.reject(new Error("prewarm failed"));
+        void failedInit.catch(() => undefined);
+        return {
+          engine: {
+            initialize: vi.fn(),
+            getReadinessState: () => "degraded" as const,
+            getLastInitError: () => new Error("prewarm failed"),
+          } as never,
+          initPromise: failedInit,
+        };
+      })(),
+      createCorrectionEngine: () =>
+        ({ initialize: freshInitialize, getReadinessState: () => "building" as const } as never),
+      createAutocorrectEditor: (() => ({}) as never) as never,
+    });
+    const ctx = createCommandContext();
+
+    const genBefore = command.state.generation;
+
+    // enable() should detect degraded, bump generation, discard, and build fresh.
+    await command.handler("on", ctx);
+
+    expect(command.state.generation).toBeGreaterThan(genBefore);
+    expect(freshInitialize).toHaveBeenCalledTimes(1);
+    expect(command.state.enabled).toBe(true);
+    expect(ctx.statusUpdates).toContainEqual({ key: "typos", value: "Autocorrect loading\u2026" });
+
+    // Cleanup.
+    freshInitDeferred.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
   });
 
   async function createDictionary(): Promise<LearnedDictionary> {

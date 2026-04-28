@@ -76,13 +76,14 @@ describe("toggle lifecycle integration", () => {
       learnedDictionary,
       techDictPath: "/tmp/tech-dict.txt",
       config: new Config({ filePath: join(tempDir, `config-${randomUUID()}.json`) }),
-      createCorrectionEngine: () => ({ initialize, shouldCorrect } as never),
+      createCorrectionEngine: () => ({ initialize, shouldCorrect, getReadinessState: () => "building" as const } as never),
     });
     const ctx = createCommandContext();
 
     await command.handler("on", ctx);
 
     expect(command.state.enabled).toBe(true);
+    // With the new non-blocking design, initialize() is called once on first enable.
     expect(initialize).toHaveBeenCalledTimes(1);
     expect(ctx.setEditorComponentCalls.at(-1)).toEqual(expect.any(Function));
     expect(ctx.currentEditor).toBeDefined();
@@ -105,7 +106,9 @@ describe("toggle lifecycle integration", () => {
     await command.handler("on", ctx);
 
     expect(command.state.enabled).toBe(true);
-    expect(initialize).toHaveBeenCalledTimes(1);
+    // disable() now drops the engine, so the second enable() constructs a fresh one
+    // and calls initialize() again (Section 5.3: always discard, always rebuild).
+    expect(initialize).toHaveBeenCalledTimes(2);
     expect(ctx.setEditorComponentCalls.filter((call) => typeof call === "function")).toHaveLength(2);
     expect(await readPersisted(filePath)).toMatchObject({
       words: {},

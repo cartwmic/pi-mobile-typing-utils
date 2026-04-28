@@ -89,3 +89,46 @@ Known limitation: apostrophe handling is not reliable for mobile-style contracti
 - TODO cold-start procedure:
 - TODO measured cold-init time:
 - Target: ≤2s cold init on the reference Termux device.
+
+## Adaptive ED + Cache (improve-autocorrect-quality-and-startup)
+
+### Empirical measurements that drove the design
+
+#### Build-time table (macOS, cold start, no cache)
+
+| ED | Build time | Heap delta | Delete buckets | Notes |
+|----|-----------|------------|----------------|-------|
+| 1  | 511 ms    | +65 MB     | 316k           |       |
+| 2  | 1 219 ms  | +100 MB    | 662k           |       |
+| 3  | 2 204 ms  | +121 MB    | 750k           |       |
+| 4  | 3 147 ms  | +137 MB    | 753k           | lookups 7× slower |
+
+These numbers were measured during the design phase. Exact reproduction is available via `npx tsx bench/build-time.ts` (results vary by hardware; Termux/phone times are 3–10× higher).
+
+#### Cache prototype measurements
+
+| Scenario                      | Time    | Notes              |
+|-------------------------------|---------|--------------------|
+| Fresh ED=4 build              | 3 263 ms |                   |
+| Cache load (read + parse)     | 189 ms  | ~17× speedup       |
+| Cache file size               | 29.8 MB |                   |
+| Fidelity                      | ✓       | All sample lookups match fresh build |
+
+See `npx tsx bench/cache-load-time.ts` and `npx tsx bench/format-size.ts` for reproducible measurements.
+
+#### Binary format rationale
+
+| Format         | Approximate size | Notes                                   |
+|----------------|------------------|-----------------------------------------|
+| JSON           | ~86 MB           | Human-readable; too large               |
+| JSON + gzip    | ~27 MB           | Requires decompression stream           |
+| Binary (naive) | ~50 MB           | Without string-table deduplication      |
+| Binary (v1)    | ~29.8 MB         | Deduplicated string table; chosen format |
+
+The custom binary format with a deduplicated string table is the best balance of size and parse speed for the steady-state cache-hit path (~200 ms on macOS).
+
+#### Why bigrams were dropped
+
+`grep` of the codebase confirmed that only `lookup()` is called — `lookupCompound()` and `wordSegmentation()` (the only consumers of bigrams) are never invoked. Loading ~243k bigram entries costs ~24 MB resident memory and roughly 30% of fresh-build time with zero benefit for the `lookup()`-only pipeline. The unigram-only loader (`loadDictionary(text, 0, 1)`) skips bigrams entirely.
+
+When the future "compound correction" capability lands, bigrams will return and the cache schema version will bump from v1 to v2 (existing caches auto-invalidate via the schema version in the cache key).

@@ -18,6 +18,18 @@ export type ConfigSnapshot = {
    * or `wq` from triggering wild corrections.
    */
   minWordLength: number;
+  /**
+   * Floor edit distance for the adaptive ED curve: ED(L) = clamp(minED +
+   * floor((L − minWordLength) / step), minED, maxED). Words at or below
+   * minWordLength are looked up at exactly this distance.
+   */
+  minEditDistance: number;
+  /**
+   * How many additional characters of word length it takes to ramp the
+   * effective edit distance up by one step. Lower values ramp more
+   * aggressively; higher values keep the distance tighter for longer.
+   */
+  editDistanceStepEvery: number;
 };
 
 type PersistedConfig = {
@@ -25,16 +37,24 @@ type PersistedConfig = {
   defaultMode?: DefaultMode;
   maxEditDistance?: number;
   minWordLength?: number;
+  minEditDistance?: number;
+  editDistanceStepEvery?: number;
 };
 
 export const DEFAULT_CONFIG: ConfigSnapshot = Object.freeze({
   defaultMode: "off" as const,
   maxEditDistance: 2,
   minWordLength: 2,
+  minEditDistance: 1,
+  editDistanceStepEvery: 4,
 });
 
-export const MAX_EDIT_DISTANCE_RANGE = Object.freeze({ min: 1, max: 3 });
+export const MAX_EDIT_DISTANCE_RANGE = Object.freeze({ min: 1, max: 4 });
 export const MIN_WORD_LENGTH_RANGE = Object.freeze({ min: 2, max: 8 });
+/** Absolute minimum value for minEditDistance (the lower bound never changes). */
+export const MIN_EDIT_DISTANCE_RANGE_MIN = 0;
+/** Range for editDistanceStepEvery: number of characters of word-length growth per +1 ED step. */
+export const EDIT_DISTANCE_STEP_EVERY_RANGE = Object.freeze({ min: 1, max: 8 });
 
 export class Config {
   private state: ConfigSnapshot = { ...DEFAULT_CONFIG };
@@ -54,14 +74,20 @@ export class Config {
         throw new InvalidConfigError("Invalid config file format");
       }
 
+      const resolvedMaxEditDistance =
+        normalizeIntInRange(parsed.maxEditDistance, MAX_EDIT_DISTANCE_RANGE) ??
+        DEFAULT_CONFIG.maxEditDistance;
+
       this.state = {
         defaultMode: normalizeDefaultMode(parsed.defaultMode) ?? DEFAULT_CONFIG.defaultMode,
-        maxEditDistance:
-          normalizeIntInRange(parsed.maxEditDistance, MAX_EDIT_DISTANCE_RANGE) ??
-          DEFAULT_CONFIG.maxEditDistance,
+        maxEditDistance: resolvedMaxEditDistance,
         minWordLength:
           normalizeIntInRange(parsed.minWordLength, MIN_WORD_LENGTH_RANGE) ??
           DEFAULT_CONFIG.minWordLength,
+        minEditDistance: resolveMinEditDistance(parsed.minEditDistance, resolvedMaxEditDistance),
+        editDistanceStepEvery:
+          normalizeIntInRange(parsed.editDistanceStepEvery, EDIT_DISTANCE_STEP_EVERY_RANGE) ??
+          DEFAULT_CONFIG.editDistanceStepEvery,
       };
     } catch (error) {
       this.state = { ...DEFAULT_CONFIG };
@@ -86,6 +112,8 @@ export class Config {
         defaultMode: this.state.defaultMode,
         maxEditDistance: this.state.maxEditDistance,
         minWordLength: this.state.minWordLength,
+        minEditDistance: this.state.minEditDistance,
+        editDistanceStepEvery: this.state.editDistanceStepEvery,
       } satisfies PersistedConfig,
       null,
       2,
@@ -148,6 +176,58 @@ export class Config {
     await this.save();
   }
 
+  /** Read the current minEditDistance on every call (no rebuild). */
+  getMinEditDistance(): number {
+    return this.state.minEditDistance;
+  }
+
+  /**
+   * Set minEditDistance and persist asynchronously.
+   * Throws {@link RangeError} if `value` is non-integer, less than
+   * {@link MIN_EDIT_DISTANCE_RANGE_MIN} (0), or greater than the current
+   * `maxEditDistance`.
+   */
+  async setMinEditDistance(value: number): Promise<void> {
+    if (
+      !Number.isInteger(value) ||
+      value < MIN_EDIT_DISTANCE_RANGE_MIN ||
+      value > this.state.maxEditDistance
+    ) {
+      throw new RangeError(
+        `minEditDistance must be a non-negative integer not greater than maxEditDistance (${this.state.maxEditDistance})`,
+      );
+    }
+    if (this.state.minEditDistance === value) {
+      return;
+    }
+    this.state.minEditDistance = value;
+    await this.save();
+  }
+
+  /** Read the current editDistanceStepEvery on every call (no rebuild). */
+  getEditDistanceStepEvery(): number {
+    return this.state.editDistanceStepEvery;
+  }
+
+  /**
+   * Set editDistanceStepEvery and persist asynchronously.
+   * Throws {@link RangeError} if `value` is outside
+   * {@link EDIT_DISTANCE_STEP_EVERY_RANGE} or non-integer.
+   */
+  async setEditDistanceStepEvery(value: number): Promise<void> {
+    const validated = normalizeIntInRange(value, EDIT_DISTANCE_STEP_EVERY_RANGE);
+    if (validated === undefined) {
+      throw new RangeError(
+        `editDistanceStepEvery must be an integer in [${EDIT_DISTANCE_STEP_EVERY_RANGE.min}, ${EDIT_DISTANCE_STEP_EVERY_RANGE.max}]`,
+      );
+    }
+    if (this.state.editDistanceStepEvery === validated) {
+      return;
+    }
+    this.state.editDistanceStepEvery = validated;
+    await this.save();
+  }
+
   snapshot(): ConfigSnapshot {
     return { ...this.state };
   }
@@ -178,6 +258,33 @@ function normalizeIntInRange(
     return undefined;
   }
   return value;
+}
+
+/**
+ * Resolve the persisted `minEditDistance` value against the already-resolved
+ * `maxEditDistance`.
+ *
+ * Rules (in order):
+ * 1. If the raw value is not a non-negative integer, fall back to the bootstrap
+ *    default (`DEFAULT_CONFIG.minEditDistance`).
+ * 2. If the raw value is valid but exceeds `resolvedMaxEditDistance` (invariant
+ *    violation), **preserve** `resolvedMaxEditDistance` (the user may have set
+ *    it deliberately) and repair `minEditDistance` to
+ *    `min(DEFAULT_CONFIG.minEditDistance, resolvedMaxEditDistance)`.
+ * 3. Otherwise accept the raw value as-is.
+ */
+function resolveMinEditDistance(rawValue: unknown, resolvedMaxEditDistance: number): number {
+  if (
+    typeof rawValue !== "number" ||
+    !Number.isInteger(rawValue) ||
+    rawValue < MIN_EDIT_DISTANCE_RANGE_MIN
+  ) {
+    return DEFAULT_CONFIG.minEditDistance;
+  }
+  if (rawValue > resolvedMaxEditDistance) {
+    return Math.min(DEFAULT_CONFIG.minEditDistance, resolvedMaxEditDistance);
+  }
+  return rawValue;
 }
 
 class InvalidConfigError extends Error {}

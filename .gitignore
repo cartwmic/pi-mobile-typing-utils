@@ -31,3 +31,8 @@ yarn-debug.log*
 
 # Probe scratch
 probe.ts.local
+
+# Benchmark exploration scratch (root-level cache artifacts from bench/ runs)
+/cache.json
+/cache.json.gz
+

@@ -1,9 +1,10 @@
-# Specification
+## RENAMED Requirements
 
-## Purpose
+- FROM: `### Requirement: Toggle serialization during async initialization`
+- TO: `### Requirement: Toggle serialization and orphan-promise generation guard`
 
-The `/typos` command is the user-facing control surface for autocorrect. It supports `on`, `off`, bare-toggle, status reporting, idempotent re-issue, lazy engine initialization with status feedback, async-init serialization (final state wins), routes `dict` subcommands to dictionary management, routes `default` subcommands to the persisted default mode for new sessions, and routes `config` subcommands to a flat key/value tuning surface (`defaultMode`, `maxEditDistance`, `minWordLength`). Autocorrect state is per-session — each new Pi session starts in the configured default mode (which itself defaults to disabled if never set), regardless of the prior session's state.
-## Requirements
+## MODIFIED Requirements
+
 ### Requirement: Enable autocorrect with /typos on
 The `/typos on` command SHALL enable autocorrect for the current session by replacing Pi's editor with the AutocorrectEditor via `ctx.ui.setEditorComponent()`. On first enable, the command SHALL trigger lazy initialization of the correction engine — including loading dictionaries or hydrating from the on-disk index cache — but SHALL NOT block on initialization completing. The editor SHALL be installed immediately and accept keystrokes; the engine's existing graceful-degradation behavior (returning `{corrected: false}` while not ready) SHALL apply for the brief window before init completes. The persistent status indicator (`setStatus("typos", ...)`, see the "Status indicator when autocorrect is active" requirement) SHALL carry the live readiness story (`"Autocorrect loading…"` while building, `"✓ Autocorrect"` once ready, `"Autocorrect unavailable"` if degraded). The previously-used loading status key `"typos-loading"` SHALL NOT be set anymore — it is redundant with the persistent indicator and would render two simultaneous "loading" widgets to the user.
 
@@ -39,89 +40,24 @@ The `/typos on` command SHALL enable autocorrect for the current session by repl
 - **WHEN** the engine is in `degraded` state and the user runs `/typos on` while autocorrect is already enabled
 - **THEN** the extension SHALL show "Autocorrect is already on" (existing behavior); the user must explicitly disable and re-enable to trigger a retry, OR change a config knob that triggers a rebuild
 
-### Requirement: Disable autocorrect with /typos off
-The `/typos off` command SHALL disable autocorrect for the current session by restoring Pi's default editor via `ctx.ui.setEditorComponent(undefined)`.
+### Requirement: Toggle serialization and orphan-promise generation guard
+Enable/disable operations SHALL be serialized via the existing toggle-queue mechanism. The final requested state wins. Background engine initialization SHALL be tracked via an `initInFlight` promise, but `disable()` and `/typos config maxEditDistance` SHALL NOT await this promise (per the non-blocking scenarios below). Instead, those operations SHALL bump an orphan-generation token; every `.then`/`.catch` callback attached to `initInFlight` SHALL capture the generation at attachment time and early-return when the captured generation no longer matches the current `state.generation` OR when `state.enabled === false`. This prevents orphaned init's resolution from clobbering UI state the user has since changed. See design.md "Orphan-promise generation guard" for the full rule.
 
-#### Scenario: Disable autocorrect
-- **WHEN** the user runs `/typos off` and autocorrect is currently enabled
-- **THEN** the editor SHALL be restored to the default and a notification SHALL show "Autocorrect OFF"
+#### Scenario: Orphaned init callbacks make no UI side effects
+- **WHEN** an `initialize()` call is attached to `state.initInFlight`, the user then runs `/typos off` (which bumps the generation), and the orphaned init subsequently resolves or rejects
+- **THEN** the orphan's `.then`/`.catch` callbacks SHALL detect the generation mismatch and early-return; no `setStatus`, `notify`, or `state.engine` mutation SHALL occur on the orphaned engine's behalf
 
-#### Scenario: Already disabled
-- **WHEN** the user runs `/typos off` and autocorrect is already disabled
-- **THEN** the extension SHALL show "Autocorrect is already off"
+#### Scenario: Disable during initialization is non-blocking
+- **WHEN** the user runs `/typos on` (triggering background initialization) and then immediately runs `/typos off` before initialization completes
+- **THEN** the extension SHALL clear the editor and persistent status indicator immediately (within a few milliseconds, not waiting for initialization to complete) and show "Autocorrect OFF". The orphan-generation token SHALL be bumped so the in-flight initialization's `.then`/`.catch` callbacks no-op when they eventually fire (per the design.md "Orphan-promise generation guard" decision). The orphan engine's resolution SHALL NOT be retained in `state.engine`; the next `/typos on` constructs a fresh engine.
 
-### Requirement: Toggle autocorrect with /typos
-The `/typos` command with no arguments SHALL toggle autocorrect: enable if disabled, disable if enabled.
+#### Scenario: Double enable during initialization
+- **WHEN** the user runs `/typos on` while a previous `/typos on` is still loading in the background
+- **THEN** the extension SHALL recognize the duplicate intent and SHALL NOT start a second initialization. It SHALL emit `"Autocorrect is already on"` (existing already-enabled behavior) without re-installing the editor. The original in-flight init's `.then`/`.catch` continues to drive the persistent `"typos"` indicator's transition; no second "Autocorrect ON" notification SHALL be emitted (the original toggle's notification stands).
 
-#### Scenario: Toggle from off to on
-- **WHEN** the user runs `/typos` and autocorrect is disabled
-- **THEN** autocorrect SHALL be enabled and a notification SHALL show "Autocorrect ON"
-
-#### Scenario: Toggle from on to off
-- **WHEN** the user runs `/typos` and autocorrect is enabled
-- **THEN** autocorrect SHALL be disabled and a notification SHALL show "Autocorrect OFF"
-
-### Requirement: Autocorrect state is per-session
-Autocorrect state SHALL NOT persist across Pi sessions. Each new session SHALL start in the configured default mode (see "Default mode configuration"); when no default mode has been configured, sessions SHALL start with autocorrect disabled. The learned dictionary loads at extension init (for `/typos dict` availability); correction-engine dictionaries (English + tech) are not loaded until first enable, OR — when `defaultMode === "on"` — engine initialization SHALL be pre-warmed during extension load (before `session_start` fires) so that the engine is more likely to be `ready` by the time the user types their first word. Pre-warming SHALL itself be non-blocking and SHALL not delay extension load.
-
-#### Scenario: New session starts in the configured default mode
-- **WHEN** the user starts a new Pi session
-- **THEN** autocorrect SHALL be reconciled to the configured default mode; when no default mode has been configured, autocorrect SHALL be disabled; the learned dictionary SHALL be loaded (for `/typos dict` availability) but the correction-engine dictionaries (English + tech) SHALL NOT be loaded until first enable (or until the configured default mode is `on`, in which case they begin loading as part of extension-load pre-warming)
-
-#### Scenario: Engine pre-warms at extension load when defaultMode is on
-- **WHEN** the extension factory function is invoked and `config.defaultMode === "on"`
-- **THEN** the extension SHALL kick off engine initialization in the background (without awaiting it) before the `session_start` event fires; on Pi instances that fire `session_start` quickly after extension load, the engine may not yet be `ready` when the editor is installed, in which case the existing graceful-degradation behavior applies
-
-#### Scenario: applyDefaultMode reuses the pre-warmed engine
-- **WHEN** the extension has pre-warmed an engine at extension load time and `applyDefaultMode` (triggered by `session_start`) subsequently calls `enable()`
-- **THEN** the toggle command SHALL reuse the pre-warmed engine instance (and its in-flight initialization promise, if still pending) rather than constructing a second engine; only one initialization SHALL be in flight at a time
-
-#### Scenario: Pre-warm failure surfaces on first enable
-- **WHEN** pre-warm initialization has failed (engine is in `degraded` state) before the first `enable()` call
-- **THEN** the first `enable()` SHALL discard the degraded engine and start fresh initialization (matching the "`/typos on` while degraded retries initialization" scenario); no error notification SHALL be emitted from the pre-warm itself, because there is no UI context yet — the failure surfaces at the first `enable()` instead
-
-#### Scenario: No pre-warm when defaultMode is off
-- **WHEN** the extension factory function is invoked and `config.defaultMode === "off"`
-- **THEN** the extension SHALL NOT pre-warm the engine; initialization SHALL only occur on the first `/typos on` (or `/typos`) toggle
-
-### Requirement: Default mode configuration
-The extension SHALL persist a `defaultMode` configuration value that controls the autocorrect state new sessions start in. The configuration SHALL be stored in a JSON file at `~/.pi/agent/mobile-autocorrect-config.json` by default, overridable via the `MOBILE_AUTOCORRECT_CONFIG_PATH` environment variable. The bootstrap value of `defaultMode` SHALL be `"off"`, preserving the long-standing per-session behavior for users who never configure it. The `/typos default` subcommand SHALL expose this configuration, and on every `session_start` event the extension SHALL reconcile session state to the configured value, in both directions (off→on and on→off), with already-in-state cases as silent no-ops.
-
-#### Scenario: Inspect the current default mode
-- **WHEN** the user runs `/typos default`
-- **THEN** the extension SHALL show "Default mode for new sessions: <mode>" where `<mode>` is the current configured value (`on` or `off`)
-
-#### Scenario: Configure default mode to on
-- **WHEN** the user runs `/typos default on` and the previous configured value is `off`
-- **THEN** the configuration SHALL be persisted to disk with `defaultMode: "on"` and a notification SHALL show "Default mode for new sessions set to on"
-
-#### Scenario: Configure default mode to off
-- **WHEN** the user runs `/typos default off` and the previous configured value is `on`
-- **THEN** the configuration SHALL be persisted to disk with `defaultMode: "off"` and a notification SHALL show "Default mode for new sessions set to off"
-
-#### Scenario: Re-issuing the current default mode is idempotent
-- **WHEN** the user runs `/typos default off` and the configured value is already `off`
-- **THEN** the configuration file SHALL NOT be rewritten and the notification SHALL show "Default mode is already off"; the same idempotent behavior applies to `/typos default on` when already `on`
-
-#### Scenario: Reject invalid default mode arguments
-- **WHEN** the user runs `/typos default <anything other than on or off>`
-- **THEN** the extension SHALL show "Usage: /typos default [on|off]" and SHALL NOT modify the configuration
-
-#### Scenario: Session-start reconciliation when default is on
-- **WHEN** a session_start event fires (reason `startup`, `reload`, `new`, `resume`, or `fork`) and the configured default mode is `on` and autocorrect is currently disabled
-- **THEN** the extension SHALL go through the same enable path as `/typos on`, including lazy engine initialization, the editor swap, the persistent status indicator, and the "Autocorrect ON" notification
-
-#### Scenario: Session-start reconciliation when default is off
-- **WHEN** a session_start event fires and the configured default mode is `off` and autocorrect is currently enabled (e.g. carried over from a prior session via session switch)
-- **THEN** the extension SHALL go through the same disable path as `/typos off`, including the editor restore, the status-indicator clear, and the "Autocorrect OFF" notification
-
-#### Scenario: Session-start reconciliation is silent when state already matches
-- **WHEN** a session_start event fires and autocorrect is already in the configured default mode
-- **THEN** the extension SHALL NOT emit any notification and SHALL NOT toggle the editor or status indicator
-
-#### Scenario: Malformed config file is tolerated
-- **WHEN** the configuration file exists but contains invalid JSON or an unknown `defaultMode` value
-- **THEN** the extension SHALL load with the bootstrap default (`defaultMode: "off"`) and SHALL log a warning, without crashing extension initialization
+#### Scenario: maxEditDistance change during initialization is non-blocking
+- **WHEN** the user runs `/typos config maxEditDistance <n>` while a previous `enable()`'s background initialization is still running
+- **THEN** the extension SHALL persist the new value, abandon the in-flight engine (mark its result as orphaned — it MAY complete in the background, but its state SHALL NOT be used after orphaning), and start a fresh initialization with the new value via the normal lazy-fire path. The user-visible state SHALL transition immediately to "loading with new ED" without waiting for the abandoned init to finish.
 
 ### Requirement: Status indicator when autocorrect is active
 When autocorrect is enabled, the extension SHALL show a persistent status indicator via `ctx.ui.setStatus()` whose value reflects the engine's readiness state. The status key SHALL be `"typos"` (distinct from the correction-feedback key `"typos-correction"`; the previously-used loading key `"typos-loading"` is no longer used — the `"typos"` indicator carries the loading state itself). The indicator SHALL take one of three forms based on the engine's readiness:
@@ -148,31 +84,28 @@ When autocorrect is disabled, the indicator SHALL be cleared.
 - **WHEN** autocorrect is disabled via `/typos off` or `/typos`
 - **THEN** the status indicator SHALL be removed via `setStatus("typos", undefined)`
 
-### Requirement: Route to dictionary subcommands
-The `/typos` command SHALL route arguments starting with "dict" to the dictionary management subcommands (view, search, add, remove, clear). These subcommands SHALL work regardless of whether autocorrect is enabled or disabled.
+### Requirement: Autocorrect state is per-session
+Autocorrect state SHALL NOT persist across Pi sessions. Each new session SHALL start in the configured default mode (see "Default mode configuration"); when no default mode has been configured, sessions SHALL start with autocorrect disabled. The learned dictionary loads at extension init (for `/typos dict` availability); correction-engine dictionaries (English + tech) are not loaded until first enable, OR — when `defaultMode === "on"` — engine initialization SHALL be pre-warmed during extension load (before `session_start` fires) so that the engine is more likely to be `ready` by the time the user types their first word. Pre-warming SHALL itself be non-blocking and SHALL not delay extension load.
 
-#### Scenario: Dictionary command while disabled
-- **WHEN** autocorrect is disabled and the user runs `/typos dict add kubernetes`
-- **THEN** the word SHALL be added to the learned dictionary (dictionary management is always available)
+#### Scenario: New session starts in the configured default mode
+- **WHEN** the user starts a new Pi session
+- **THEN** autocorrect SHALL be reconciled to the configured default mode; when no default mode has been configured, autocorrect SHALL be disabled; the learned dictionary SHALL be loaded (for `/typos dict` availability) but the correction-engine dictionaries (English + tech) SHALL NOT be loaded until first enable (or until the configured default mode is `on`, in which case they begin loading as part of extension-load pre-warming)
 
-### Requirement: Argument auto-completion for /typos command
-The `/typos` command SHALL provide argument completions via `getArgumentCompletions`. First-level completions SHALL include `on`, `off`, `dict`, `default`, `config`. When the first argument is `dict`, second-level completions SHALL include `add`, `remove`, `search`, `clear`. When the first argument is `default`, second-level completions SHALL include `on`, `off`. When the first argument is `config`, second-level completions SHALL include `defaultMode`, `maxEditDistance`, `minWordLength`, `minEditDistance`, `editDistanceStepEvery`, and third-level completions SHALL include the valid values for the chosen key. Second-level and deeper completion items SHALL set their `value` to the full argument path (parent token included), because Pi's `applyCompletion` replaces the entire argument text with the chosen item's `value`.
+#### Scenario: Engine pre-warms at extension load when defaultMode is on
+- **WHEN** the extension factory function is invoked and `config.defaultMode === "on"`
+- **THEN** the extension SHALL kick off engine initialization in the background (without awaiting it) before the `session_start` event fires; on Pi instances that fire `session_start` quickly after extension load, the engine may not yet be `ready` when the editor is installed, in which case the existing graceful-degradation behavior applies
 
-#### Scenario: First-level completion
-- **WHEN** the user types `/typos ` and triggers completion
-- **THEN** the extension SHALL suggest `on`, `off`, `dict`, `default`, `config`
+#### Scenario: applyDefaultMode reuses the pre-warmed engine
+- **WHEN** the extension has pre-warmed an engine at extension load time and `applyDefaultMode` (triggered by `session_start`) subsequently calls `enable()`
+- **THEN** the toggle command SHALL reuse the pre-warmed engine instance (and its in-flight initialization promise, if still pending) rather than constructing a second engine; only one initialization SHALL be in flight at a time
 
-#### Scenario: Second-level dict completion
-- **WHEN** the user types `/typos dict ` and triggers completion
-- **THEN** the extension SHALL suggest `add`, `remove`, `search`, `clear`
+#### Scenario: Pre-warm failure surfaces on first enable
+- **WHEN** pre-warm initialization has failed (engine is in `degraded` state) before the first `enable()` call
+- **THEN** the first `enable()` SHALL discard the degraded engine and start fresh initialization (matching the "`/typos on` while degraded retries initialization" scenario); no error notification SHALL be emitted from the pre-warm itself, because there is no UI context yet — the failure surfaces at the first `enable()` instead
 
-#### Scenario: Second-level default completion
-- **WHEN** the user types `/typos default ` and triggers completion
-- **THEN** the extension SHALL suggest `on`, `off`
-
-#### Scenario: Second-level config completion
-- **WHEN** the user types `/typos config ` and triggers completion
-- **THEN** the extension SHALL suggest `defaultMode`, `maxEditDistance`, `minWordLength`, `minEditDistance`, `editDistanceStepEvery`
+#### Scenario: No pre-warm when defaultMode is off
+- **WHEN** the extension factory function is invoked and `config.defaultMode === "off"`
+- **THEN** the extension SHALL NOT pre-warm the engine; initialization SHALL only occur on the first `/typos on` (or `/typos`) toggle
 
 ### Requirement: Tuning configuration via /typos config
 The extension SHALL expose a flat `/typos config` key/value surface for runtime-tunable parameters, persisted to the same configuration file as `defaultMode`. The supported keys SHALL be `defaultMode`, `maxEditDistance`, `minWordLength`, `minEditDistance`, and `editDistanceStepEvery`. Each key SHALL be range-validated; out-of-range or non-integer values SHALL be rejected without modifying the persisted configuration. The `defaultMode` key SHALL be functionally equivalent to the dedicated `/typos default` subcommand. The `maxEditDistance` value SHALL be an integer in `[1, 4]` and SHALL be applied by rebuilding the SymSpell index (the value is baked into the index at initialization time); when autocorrect is currently enabled the rebuild SHALL happen automatically via the existing teardown-and-rebuild flow, but the rebuild itself SHALL be non-blocking (lazy fire-and-forget). The `minWordLength` value SHALL be an integer in `[2, 8]` and SHALL be applied live (read by the correction engine on each lookup, no rebuild required). The `minEditDistance` value SHALL be an integer in `[0, maxEditDistance]` and SHALL be applied live (read on each lookup, no rebuild required). The `editDistanceStepEvery` value SHALL be an integer in `[1, 8]` and SHALL be applied live (read on each lookup, no rebuild required).
@@ -253,22 +186,21 @@ The extension SHALL expose a flat `/typos config` key/value surface for runtime-
 - **WHEN** the user types `/typos config maxEditDistance ` and triggers completion
 - **THEN** the extension SHALL suggest values in `[currentMinEditDistance, 4]` (so suggestions never include values that would be rejected by the min/max invariant); analogous suggestions apply to `minWordLength` (`2` through `8`), `minEditDistance` (`0` through current `maxEditDistance`), `editDistanceStepEvery` (`1` through `8`), and `defaultMode` (`on`, `off`)
 
-### Requirement: Toggle serialization and orphan-promise generation guard
-Enable/disable operations SHALL be serialized via the existing toggle-queue mechanism. The final requested state wins. Background engine initialization SHALL be tracked via an `initInFlight` promise, but `disable()` and `/typos config maxEditDistance` SHALL NOT await this promise (per the non-blocking scenarios below). Instead, those operations SHALL bump an orphan-generation token; every `.then`/`.catch` callback attached to `initInFlight` SHALL capture the generation at attachment time and early-return when the captured generation no longer matches the current `state.generation` OR when `state.enabled === false`. This prevents orphaned init's resolution from clobbering UI state the user has since changed. See design.md "Orphan-promise generation guard" for the full rule.
+### Requirement: Argument auto-completion for /typos command
+The `/typos` command SHALL provide argument completions via `getArgumentCompletions`. First-level completions SHALL include `on`, `off`, `dict`, `default`, `config`. When the first argument is `dict`, second-level completions SHALL include `add`, `remove`, `search`, `clear`. When the first argument is `default`, second-level completions SHALL include `on`, `off`. When the first argument is `config`, second-level completions SHALL include `defaultMode`, `maxEditDistance`, `minWordLength`, `minEditDistance`, `editDistanceStepEvery`, and third-level completions SHALL include the valid values for the chosen key. Second-level and deeper completion items SHALL set their `value` to the full argument path (parent token included), because Pi's `applyCompletion` replaces the entire argument text with the chosen item's `value`.
 
-#### Scenario: Orphaned init callbacks make no UI side effects
-- **WHEN** an `initialize()` call is attached to `state.initInFlight`, the user then runs `/typos off` (which bumps the generation), and the orphaned init subsequently resolves or rejects
-- **THEN** the orphan's `.then`/`.catch` callbacks SHALL detect the generation mismatch and early-return; no `setStatus`, `notify`, or `state.engine` mutation SHALL occur on the orphaned engine's behalf
+#### Scenario: First-level completion
+- **WHEN** the user types `/typos ` and triggers completion
+- **THEN** the extension SHALL suggest `on`, `off`, `dict`, `default`, `config`
 
-#### Scenario: Disable during initialization is non-blocking
-- **WHEN** the user runs `/typos on` (triggering background initialization) and then immediately runs `/typos off` before initialization completes
-- **THEN** the extension SHALL clear the editor and persistent status indicator immediately (within a few milliseconds, not waiting for initialization to complete) and show "Autocorrect OFF". The orphan-generation token SHALL be bumped so the in-flight initialization's `.then`/`.catch` callbacks no-op when they eventually fire (per the design.md "Orphan-promise generation guard" decision). The orphan engine's resolution SHALL NOT be retained in `state.engine`; the next `/typos on` constructs a fresh engine.
+#### Scenario: Second-level dict completion
+- **WHEN** the user types `/typos dict ` and triggers completion
+- **THEN** the extension SHALL suggest `add`, `remove`, `search`, `clear`
 
-#### Scenario: Double enable during initialization
-- **WHEN** the user runs `/typos on` while a previous `/typos on` is still loading in the background
-- **THEN** the extension SHALL recognize the duplicate intent and SHALL NOT start a second initialization. It SHALL emit `"Autocorrect is already on"` (existing already-enabled behavior) without re-installing the editor. The original in-flight init's `.then`/`.catch` continues to drive the persistent `"typos"` indicator's transition; no second "Autocorrect ON" notification SHALL be emitted (the original toggle's notification stands).
+#### Scenario: Second-level default completion
+- **WHEN** the user types `/typos default ` and triggers completion
+- **THEN** the extension SHALL suggest `on`, `off`
 
-#### Scenario: maxEditDistance change during initialization is non-blocking
-- **WHEN** the user runs `/typos config maxEditDistance <n>` while a previous `enable()`'s background initialization is still running
-- **THEN** the extension SHALL persist the new value, abandon the in-flight engine (mark its result as orphaned — it MAY complete in the background, but its state SHALL NOT be used after orphaning), and start a fresh initialization with the new value via the normal lazy-fire path. The user-visible state SHALL transition immediately to "loading with new ED" without waiting for the abandoned init to finish.
-
+#### Scenario: Second-level config completion
+- **WHEN** the user types `/typos config ` and triggers completion
+- **THEN** the extension SHALL suggest `defaultMode`, `maxEditDistance`, `minWordLength`, `minEditDistance`, `editDistanceStepEvery`

@@ -1,31 +1,4 @@
-# Specification
-
-## Purpose
-
-The correction engine maps eligible mistyped tokens to corrected forms using a layered dictionary lookup (learned, tech, English) and SymSpell edit-distance search. It is the pure function at the core of the mobile-autocorrect extension: given a word, return either no correction or a casing-preserved suggestion. It owns dictionary loading, identity-correction suppression, and case-preservation rules; it does NOT decide which tokens are eligible by length (the editor and the user-configurable `minWordLength` do) or persist anything (the learned dictionary does). The engine accepts two tuning parameters at construction — `maxEditDistance` (baked into the SymSpell index) and a live `getMinWordLength()` accessor (read on every lookup) — both fed by the persisted extension config.
-## Requirements
-### Requirement: Layered dictionary lookup prevents correction of known words
-The correction engine SHALL check words against three dictionary layers in order: learned dictionary, tech dictionary, English dictionary. If ANY layer contains an exact match for the word (case-insensitive), the engine SHALL NOT suggest a correction. **Case normalization**: the engine SHALL lowercase the candidate word before each layer lookup. The learned dictionary SHALL be queried via a live lookup function (not a snapshot), so that words added or removed mid-session are immediately reflected without engine re-initialization.
-
-#### Scenario: Word exists in learned dictionary
-- **WHEN** the user types a word that exists in the learned dictionary
-- **THEN** the engine SHALL return no correction for that word
-
-#### Scenario: Newly learned word is immediately recognized
-- **WHEN** the user's correction rejection causes "termux" to be auto-learned during a session
-- **THEN** subsequent typing of "termux" SHALL NOT be corrected, without requiring engine reload or re-initialization
-
-#### Scenario: Word exists in tech dictionary
-- **WHEN** the user types "nginx", "kubectl", "zellij", or any word in the tech dictionary
-- **THEN** the engine SHALL return no correction for that word
-
-#### Scenario: Capitalized tech word recognized
-- **WHEN** the user types "Nginx", "NGINX", or "nginx"
-- **THEN** the engine SHALL recognize all variants as valid (via lowercase normalization) and return no correction
-
-#### Scenario: Word exists in English dictionary
-- **WHEN** the user types "authorization", "function", or any word with an exact match in the English dictionary
-- **THEN** the engine SHALL return no correction for that word
+## MODIFIED Requirements
 
 ### Requirement: SymSpell correction with configurable edit distance and frequency ranking
 The engine SHALL use the SymSpell algorithm (Damerau-Levenshtein distance, where transpositions count as 1 edit) with `Verbosity.Top` mode to find the single best correction for unknown words, ranked by word frequency. The maximum edit distance SHALL be configurable per the `maxEditDistance` extension config (integer in `[1, 4]`, default `2`) and SHALL be baked into the SymSpell index at engine construction time. At lookup time, the engine SHALL compute a per-word effective edit distance from the adaptive curve (see "Adaptive per-word-length edit distance" requirement below) and pass that value — not the index ceiling — to `SymSpell.lookup`. The per-call distance is permitted to be smaller than the index ceiling; SymSpell tolerates this and returns only candidates within the per-call distance.
@@ -54,43 +27,6 @@ The engine SHALL use the SymSpell algorithm (Damerau-Levenshtein distance, where
 - **WHEN** SymSpell returns the same word as the input (e.g., "the" → "the" at distance 0)
 - **THEN** the engine SHALL return `{ corrected: false }`, NOT fire a correction event
 
-### Requirement: Verify Damerau-Levenshtein semantics
-Before the engine is built, the implementation SHALL verify that symspell-ts uses Damerau-Levenshtein (transpositions = 1 edit), not plain Levenshtein (transpositions = 2 edits). If plain Levenshtein were used, the practical reach of any given `maxEditDistance` would shrink by half on transposition-style typos.
-
-#### Scenario: Verification test
-- **WHEN** the engine is initialized with the English dictionary
-- **THEN** `lookup("teh", Verbosity.Top, 1)` SHALL return "the" with distance 1, confirming transpositions are counted as a single edit
-
-### Requirement: Short words are not corrected
-The engine SHALL NOT attempt to correct words shorter than the configured `minWordLength` (integer in `[2, 8]`, default `2`), regardless of whether they match any dictionary. The threshold SHALL be read live on every `shouldCorrect` call via the `getMinWordLength` accessor passed at construction, so updates from `/typos config minWordLength <n>` take effect on the next lookup without rebuilding the engine. The internal eligibility regex MAY be cached so long as the cache is invalidated when the accessor's return value changes.
-
-#### Scenario: Word shorter than the threshold
-- **WHEN** the user types a word shorter than the configured `minWordLength`
-- **THEN** the engine SHALL return no correction
-
-#### Scenario: minWordLength change is observed live
-- **WHEN** the user changes `minWordLength` via `/typos config minWordLength <n>` while autocorrect is running
-- **THEN** the next correction lookup SHALL use the new threshold without the engine being rebuilt
-
-### Requirement: Case preservation on corrections
-When the engine returns a correction, it SHALL preserve the case pattern of the original word. Specifically: if the original word starts with an uppercase letter followed by lowercase, the correction SHALL have the same leading-uppercase pattern.
-
-#### Scenario: Leading uppercase preserved
-- **WHEN** the user types "Teh" (capital T) and the engine corrects to "the"
-- **THEN** the engine SHALL return "The" (preserving the leading capital)
-
-#### Scenario: All-uppercase preserved
-- **WHEN** the user types "TEH" and the engine corrects to "the"
-- **THEN** the engine SHALL return "THE"
-
-#### Scenario: All-lowercase unchanged
-- **WHEN** the user types "teh" and the engine corrects to "the"
-- **THEN** the engine SHALL return "the"
-
-#### Scenario: Mixed-case fallback
-- **WHEN** the user types "tHe" or "tEh" or any case pattern not matching Title-case, ALL-UPPER, or all-lower
-- **THEN** the engine SHALL return the correction in the engine's default case (lowercase from the frequency dictionary)
-
 ### Requirement: Bundled English frequency dictionary
 The engine SHALL load the symspell-ts bundled English frequency dictionary (~82K words with frequency counts). Loading SHALL happen lazily on first `/typos on` (or, when `defaultMode === "on"`, on extension load via pre-warm — see toggle-command spec), not on every session start. When loading from the bundled dictionary the engine SHALL load only the unigram (word/frequency) data; the bigram dictionary SHALL NOT be loaded because the engine only calls `lookup()`, which does not consult bigrams, and skipping the bigram pass measurably reduces both build time and resident memory. The bundled unigram file path SHALL be derived from the symspell-ts package root using the same package-root resolution rule as the index-cache spec (resolve `"symspell-ts"`, walk up to `package.json` matching `name === "symspell-ts"`, then `<pkgRoot>/data/frequency_dictionary_en_82_765.txt`).
 
@@ -114,16 +50,7 @@ The engine SHALL load the symspell-ts bundled English frequency dictionary (~82K
 - **WHEN** `resolveSymspellPackageRoot()` returns `null` and the engine falls back to upstream `loadDefaultDictionaries(symspell)`
 - **THEN** the engine SHALL still reach `ready` and serve correct lookups; bigrams MAY be present in the SymSpell instance as a side effect of the fallback. This is a documented degradation of the optimization (the cache subsystem is also disabled in this branch via `computeCacheKey() === null`); correctness is preserved.
 
-### Requirement: Bundled tech dictionary
-The engine SHALL load a pre-compiled tech/developer dictionary (~23K words aggregated from cspell-dicts) as a known-word set (not a correction source). Words in this dictionary SHALL be recognized but never suggested as corrections for other words.
-
-#### Scenario: Tech word recognized
-- **WHEN** the user types "kubernetes" which exists in the tech dictionary
-- **THEN** the engine SHALL recognize it as valid and not correct it
-
-#### Scenario: Tech dictionary is not a correction source
-- **WHEN** the user types "kubernetse" (typo of kubernetes)
-- **THEN** the engine SHALL only suggest corrections from the English frequency dictionary, not from the tech dictionary
+## ADDED Requirements
 
 ### Requirement: Adaptive per-word-length edit distance
 The engine SHALL compute a per-word effective edit distance using the formula:
@@ -214,4 +141,3 @@ The engine SHALL expose a readiness state with at least three observable values:
 #### Scenario: State becomes `degraded` on init failure
 - **WHEN** `initialize()` rejects (e.g., bundled dictionary file unreadable AND cache load also failed)
 - **THEN** the engine's readiness state SHALL be `degraded`, `shouldCorrect()` SHALL return `{ corrected: false }`, and callers SHALL be able to observe the failure to surface it to the user
-

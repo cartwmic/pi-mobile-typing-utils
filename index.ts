@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
-import { createTyposCommand } from "./src/commands.js";
+import { createTyposCommand, prewarmEngine } from "./src/commands.js";
 import { Config } from "./src/config.js";
 import { LearnedDictionary } from "./src/learned-dictionary.js";
 
@@ -33,10 +33,20 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   await config.load();
 
+  // Pre-warm the engine when the configured default mode is "on" so that
+  // initialization is already in flight before session_start fires. The call
+  // is non-blocking; errors are silently captured (the engine's readinessState
+  // transitions to "degraded" and enable() handles that on first call).
+  const prewarm =
+    config.getDefaultMode() === "on"
+      ? prewarmEngine({ techDictPath: TECH_DICTIONARY_PATH, learnedDictionary, config })
+      : undefined;
+
   const typosCommand = createTyposCommand({
     learnedDictionary,
     techDictPath: TECH_DICTIONARY_PATH,
     config,
+    prewarm,
   });
 
   pi.registerCommand("typos", {

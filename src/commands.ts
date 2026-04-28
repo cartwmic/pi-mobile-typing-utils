@@ -3,18 +3,21 @@ import type { AutocompleteItem } from "@mariozechner/pi-tui";
 
 import { AutocorrectEditor } from "./autocorrect-editor.js";
 import {
+  EDIT_DISTANCE_STEP_EVERY_RANGE,
   MAX_EDIT_DISTANCE_RANGE,
+  MIN_EDIT_DISTANCE_RANGE_MIN,
   MIN_WORD_LENGTH_RANGE,
   type Config,
   type DefaultMode,
 } from "./config.js";
+import type { ReadinessState } from "./correction-engine.js";
 import { CorrectionEngine, type CorrectionEngineOptions } from "./correction-engine.js";
 import type { LearnedDictionary } from "./learned-dictionary.js";
 
 const TOP_LEVEL_COMMANDS = ["on", "off", "dict", "default", "config"] as const;
 const DICTIONARY_SUBCOMMANDS = ["add", "remove", "search", "clear"] as const;
 const DEFAULT_SUBCOMMANDS = ["on", "off"] as const;
-const CONFIG_KEYS = ["defaultMode", "maxEditDistance", "minWordLength"] as const;
+const CONFIG_KEYS = ["defaultMode", "maxEditDistance", "minWordLength", "minEditDistance", "editDistanceStepEvery"] as const;
 const DICTIONARY_WORD_PATTERN = /^[A-Za-z]+$/;
 const MAX_DICTIONARY_RESULTS = 50;
 const DICTIONARY_USAGE = "Usage: /typos dict [search <term>|add <word>|remove <word>|clear]";
@@ -39,12 +42,42 @@ export type TyposCommandState = {
   enabled: boolean;
   engine?: CorrectionEngine;
   toggleInFlight?: Promise<void>;
+  /**
+   * The currently-tracked engine-initialization promise. Set when a background
+   * initialize() call is in flight; cleared by disable() and config rebuilds.
+   * Section 7 pre-warm can seed this alongside state.engine before the first
+   * enable() so the promise is reused rather than a second init started.
+   */
+  initInFlight?: Promise<void>;
+  /**
+   * Monotonically-increasing generation counter. Bumped whenever state.engine
+   * is torn down (disable(), maxEditDistance rebuild, degraded-state retry).
+   * Every .then/.catch callback attached to initInFlight captures this value
+   * at attachment time; the callback early-returns if the generation no longer
+   * matches ("orphan-promise generation guard", per design.md).
+   */
+  generation: number;
+};
+
+/**
+ * Handle returned by {@link prewarmEngine} representing an engine whose
+ * initialization has been kicked off but not yet awaited.
+ */
+export type PrewarmHandle = {
+  engine: CorrectionEngine;
+  initPromise: Promise<void>;
 };
 
 export type CreateTyposCommandOptions = {
   learnedDictionary: LearnedDictionary;
   techDictPath: string;
   config: Config;
+  /**
+   * Optional pre-warmed engine from {@link prewarmEngine}. When supplied the
+   * state is seeded with the existing engine and its in-flight init promise so
+   * {@link enable} reuses them rather than starting a second initialization.
+   */
+  prewarm?: PrewarmHandle;
   createCorrectionEngine?: (options: CorrectionEngineOptions) => CorrectionEngine;
   createAutocorrectEditor?: (...args: ConstructorParameters<typeof AutocorrectEditor>) => AutocorrectEditor;
 };
@@ -55,6 +88,7 @@ export function createTyposCommand({
   learnedDictionary,
   techDictPath,
   config,
+  prewarm,
   createCorrectionEngine = (options) => new CorrectionEngine(options),
   createAutocorrectEditor = (...args) => new AutocorrectEditor(...args),
 }: CreateTyposCommandOptions): {
@@ -71,6 +105,9 @@ export function createTyposCommand({
 } {
   const state: TyposCommandState = {
     enabled: false,
+    generation: 0,
+    engine: prewarm?.engine,
+    initInFlight: prewarm?.initPromise,
   };
 
   let inFlightAction: ScheduledAction | undefined;
@@ -166,7 +203,7 @@ export function createTyposCommand({
       if (valuePrefix.includes(" ")) {
         return null;
       }
-      const valueChoices = configValueChoices(key);
+      const valueChoices = configValueChoices(key, config);
       if (!valueChoices) {
         return null;
       }
@@ -233,34 +270,48 @@ export function createTyposCommand({
     await tracked;
   }
 
-  async function enable(ctx: TyposCommandContext): Promise<void> {
-    if (state.enabled) {
-      ctx.ui.notify("Autocorrect is already on", "info");
-      return;
-    }
+  // ---------------------------------------------------------------------------
+  // Section 5: Orphan-promise generation guard helpers
+  // ---------------------------------------------------------------------------
 
-    if (!state.engine) {
-      ctx.ui.setStatus("typos-loading", "Loading autocorrect...");
+  /** Capture the current generation token for attachment to an init callback. */
+  function captureGen(): number {
+    return state.generation;
+  }
 
-      try {
-        const engine = createCorrectionEngine({
-          techDictPath,
-          isLearned: (word) => learnedDictionary.has(word),
-          maxEditDistance: config.getMaxEditDistance(),
-          getMinWordLength: () => config.getMinWordLength(),
-        });
+  /**
+   * Returns true when a callback's captured generation no longer matches the
+   * current state. Used by every .then/.catch attached to state.initInFlight.
+   */
+  function isOrphan(captured: number): boolean {
+    return captured !== state.generation;
+  }
 
-        await engine.initialize();
-        state.engine = engine;
-      } catch (error) {
-        ctx.ui.notify(`Autocorrect failed to initialize: ${formatError(error)}`, "error");
-        return;
-      } finally {
-        ctx.ui.setStatus("typos-loading", undefined);
-      }
-    }
+  /**
+   * Construct a fresh CorrectionEngine and start its initialization promise.
+   * Sets both state.engine and state.initInFlight.
+   *
+   * Wire all live-accessor knobs (getMinWordLength, getMinEditDistance,
+   * getEditDistanceStepEvery) so the adaptive-ED curve is hot-reloadable
+   * without rebuilding the engine. maxEditDistance is baked at construction
+   * and is the only knob that requires a full rebuild (Section 5.4).
+   *
+   * Intentionally does NOT attach .then/.catch callbacks — callers call
+   * attachInitCallbacks(ctx, captured) with the right context.
+   * This lets Section 7's pre-warm seed state.engine + state.initInFlight
+   * without a ctx, and have enable() attach callbacks later.
+   */
+  function constructEngine(): void {
+    const engine = createCorrectionEngine(buildEngineOptions(techDictPath, learnedDictionary, config));
+    state.engine = engine;
+    state.initInFlight = engine.initialize();
+  }
 
-    state.enabled = true;
+  /**
+   * Install (or re-install) the AutocorrectEditor using the current state.engine.
+   * Single choke-point so Section 7 can reuse it for pre-warm hand-off.
+   */
+  function installEditor(ctx: TyposCommandContext): void {
     ctx.ui.setEditorComponent((tui, theme, keybindings) =>
       createAutocorrectEditor(tui, theme, keybindings, {
         correctionEngine: state.engine!,
@@ -271,8 +322,116 @@ export function createTyposCommand({
         },
       }),
     );
-    ctx.ui.setStatus("typos", "✓ Autocorrect");
-    ctx.ui.notify("Autocorrect ON", "info");
+  }
+
+  /**
+   * Single choke-point for updating the persistent "typos" status indicator.
+   * Section 6 will extend this to handle additional indicator state.
+   */
+  function updateTyposStatus(ctx: TyposCommandContext, value: string | undefined): void {
+    ctx.ui.setStatus("typos", value);
+  }
+
+  /**
+   * Attach generation-guarded .then/.catch callbacks to state.initInFlight.
+   * Called from enable() and internalRebuild() after state.initInFlight is set.
+   */
+  function attachInitCallbacks(ctx: TyposCommandContext, captured: number): void {
+    void state.initInFlight!.then(
+      () => onInitResolved(ctx, captured),
+      (err: unknown) => onInitFailed(ctx, captured, err),
+    );
+  }
+
+  /**
+   * Fired when the in-flight initialize() resolves successfully.
+   * Guards against orphaned promises (generation mismatch) and early-returns
+   * when the user has disabled autocorrect in the meantime.
+   */
+  function onInitResolved(ctx: TyposCommandContext, captured: number): void {
+    if (isOrphan(captured) || !state.enabled) return;
+    updateTyposStatus(ctx, "✓ Autocorrect");
+  }
+
+  /**
+   * Fired when the in-flight initialize() rejects.
+   * Guards against orphans the same way as onInitResolved, then surfaces
+   * the error once via the persistent indicator and an error notification.
+   */
+  function onInitFailed(ctx: TyposCommandContext, captured: number, err: unknown): void {
+    if (isOrphan(captured) || !state.enabled) return;
+    updateTyposStatus(ctx, "Autocorrect unavailable");
+    ctx.ui.notify(`Autocorrect initialization failed: ${formatError(err)}`, "error");
+  }
+
+  /**
+   * Rebuild the engine in the background while autocorrect remains enabled.
+   * Used by handleSetMaxEditDistance() after a config change — does NOT emit
+   * "Autocorrect OFF" or "Autocorrect ON (loading…)" notifications (only the
+   * maxEditDistance success notification fires). The persistent "typos"
+   * indicator transitions through readiness states via the callbacks.
+   *
+   * Precondition: state.generation has already been bumped and the old
+   * state.engine / state.initInFlight have been cleared by the caller.
+   */
+  function internalRebuild(ctx: TyposCommandContext): void {
+    constructEngine();
+    const captured = captureGen();
+    attachInitCallbacks(ctx, captured);
+    installEditor(ctx);
+    updateTyposStatus(ctx, "Autocorrect loading…");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Core toggle actions
+  // ---------------------------------------------------------------------------
+
+  async function enable(ctx: TyposCommandContext): Promise<void> {
+    if (state.enabled) {
+      ctx.ui.notify("Autocorrect is already on", "info");
+      return;
+    }
+
+    // 5.6: degraded-state retry — if the engine (e.g. from a pre-warm) failed
+    // initialization while autocorrect was disabled, discard it and build fresh.
+    if (state.engine?.getReadinessState() === "degraded") {
+      state.generation++;
+      state.engine = undefined;
+      state.initInFlight = undefined;
+    }
+
+    // Construct a fresh engine if we don't have one yet.
+    if (!state.engine) {
+      constructEngine();
+    }
+
+    const readiness = state.engine!.getReadinessState();
+
+    if (readiness === "ready") {
+      // Engine already warm (pre-warm hit or reused). Install immediately.
+      state.enabled = true;
+      installEditor(ctx);
+      updateTyposStatus(ctx, "✓ Autocorrect");
+      ctx.ui.notify("Autocorrect ON", "info");
+      return;
+    }
+
+    // Engine is building (fresh construction or pre-warm in flight).
+    // Attach generation-guarded callbacks so the status indicator updates
+    // when init completes, then return control to the caller immediately
+    // (non-blocking per the design.md Orphan-promise generation guard decision).
+    const captured = captureGen();
+    if (!state.initInFlight) {
+      // Defensive: shouldn't happen after constructEngine(), but guard against
+      // an externally-seeded engine (Section 7 pre-warm) that somehow has no
+      // initInFlight reference.
+      state.initInFlight = state.engine!.initialize();
+    }
+    attachInitCallbacks(ctx, captured);
+    state.enabled = true;
+    installEditor(ctx);
+    updateTyposStatus(ctx, "Autocorrect loading…");
+    ctx.ui.notify("Autocorrect ON (loading…)", "info");
   }
 
   async function disable(ctx: TyposCommandContext): Promise<void> {
@@ -281,9 +440,17 @@ export function createTyposCommand({
       return;
     }
 
+    // 5.3: Bump generation first — this orphans any in-flight init's callbacks
+    // (their captured generation will no longer match state.generation).
+    state.generation++;
     state.enabled = false;
     ctx.ui.setEditorComponent(undefined);
-    ctx.ui.setStatus("typos", undefined);
+    updateTyposStatus(ctx, undefined);
+    // Drop engine and initInFlight. The orphaned initialize() MAY complete in
+    // the background, but its result SHALL NOT be retained (design.md
+    // "Orphan-promise generation guard": always discard, let next enable rebuild).
+    state.initInFlight = undefined;
+    state.engine = undefined;
     ctx.ui.notify("Autocorrect OFF", "info");
   }
 
@@ -354,6 +521,8 @@ export function createTyposCommand({
       `defaultMode      ${config.getDefaultMode()}`,
       `maxEditDistance  ${config.getMaxEditDistance()}  (range ${MAX_EDIT_DISTANCE_RANGE.min}-${MAX_EDIT_DISTANCE_RANGE.max})`,
       `minWordLength    ${config.getMinWordLength()}  (range ${MIN_WORD_LENGTH_RANGE.min}-${MIN_WORD_LENGTH_RANGE.max})`,
+      `minEditDistance  ${config.getMinEditDistance()}  (range ${MIN_EDIT_DISTANCE_RANGE_MIN}-${config.getMaxEditDistance()})`,
+      `editDistanceStepEvery  ${config.getEditDistanceStepEvery()}  (range ${EDIT_DISTANCE_STEP_EVERY_RANGE.min}-${EDIT_DISTANCE_STEP_EVERY_RANGE.max})`,
     ];
     ctx.ui.notify(`Mobile autocorrect config:\n${lines.join("\n")}`, "info");
   }
@@ -395,6 +564,16 @@ export function createTyposCommand({
       await handleSetMinWordLength(ctx, remainder);
       return;
     }
+
+    if (key === "minEditDistance") {
+      await handleSetMinEditDistance(ctx, remainder);
+      return;
+    }
+
+    if (key === "editDistanceStepEvery") {
+      await handleSetEditDistanceStepEvery(ctx, remainder);
+      return;
+    }
   }
 
   function showSingleConfig(ctx: TyposCommandContext, key: ConfigKey): void {
@@ -414,14 +593,37 @@ export function createTyposCommand({
           "info",
         );
         return;
+      case "minEditDistance":
+        ctx.ui.notify(
+          `minEditDistance = ${config.getMinEditDistance()} (range ${MIN_EDIT_DISTANCE_RANGE_MIN}-${config.getMaxEditDistance()})`,
+          "info",
+        );
+        return;
+      case "editDistanceStepEvery":
+        ctx.ui.notify(
+          `editDistanceStepEvery = ${config.getEditDistanceStepEvery()} (range ${EDIT_DISTANCE_STEP_EVERY_RANGE.min}-${EDIT_DISTANCE_STEP_EVERY_RANGE.max})`,
+          "info",
+        );
+        return;
     }
   }
 
   async function handleSetMaxEditDistance(ctx: TyposCommandContext, raw: string): Promise<void> {
+    // 5.4.1: validate range [1, 4]
     const value = parseIntInRange(raw, MAX_EDIT_DISTANCE_RANGE);
     if (value === undefined) {
       ctx.ui.notify(
         `Usage: /typos config maxEditDistance <integer ${MAX_EDIT_DISTANCE_RANGE.min}-${MAX_EDIT_DISTANCE_RANGE.max}>`,
+        "warning",
+      );
+      return;
+    }
+
+    // 5.4.1: also reject if n < current minEditDistance (BEFORE persisting)
+    const currentMin = config.getMinEditDistance();
+    if (value < currentMin) {
+      ctx.ui.notify(
+        `maxEditDistance cannot be less than current minEditDistance (${currentMin}); change minEditDistance first`,
         "warning",
       );
       return;
@@ -432,6 +634,7 @@ export function createTyposCommand({
       return;
     }
 
+    // 5.4.2: persist
     try {
       await config.setMaxEditDistance(value);
     } catch (error) {
@@ -439,20 +642,73 @@ export function createTyposCommand({
       return;
     }
 
-    // maxEditDistance is baked into the SymSpell index at initialize().
-    // Drop the cached engine so the next enable() rebuilds with the new
-    // value. If autocorrect is currently running, tear it down and bring
-    // it right back up so the user sees the change take effect now
-    // (mirrors a manual /typos off; /typos on, but automated).
-    const wasEnabled = state.enabled;
-    if (wasEnabled) {
-      await disable(ctx);
-    }
+    // 5.4.3: bump generation, orphan any in-flight init
+    state.generation++;
     state.engine = undefined;
+    state.initInFlight = undefined;
+
     ctx.ui.notify(`maxEditDistance set to ${value}`, "info");
-    if (wasEnabled) {
-      await enable(ctx);
+
+    // 5.4.4: if enabled, rebuild in background (no "Autocorrect OFF/ON" notifications)
+    // 5.4.5: if disabled, do nothing — new value takes effect on next /typos on
+    if (state.enabled) {
+      internalRebuild(ctx);
     }
+  }
+
+  async function handleSetMinEditDistance(ctx: TyposCommandContext, raw: string): Promise<void> {
+    const currentMax = config.getMaxEditDistance();
+    const value = parseIntInRange(raw, { min: MIN_EDIT_DISTANCE_RANGE_MIN, max: currentMax });
+    if (value === undefined) {
+      ctx.ui.notify(
+        `Usage: /typos config minEditDistance <integer ${MIN_EDIT_DISTANCE_RANGE_MIN}-${currentMax}>`,
+        "warning",
+      );
+      return;
+    }
+
+    if (config.getMinEditDistance() === value) {
+      ctx.ui.notify(`minEditDistance is already ${value}`, "info");
+      return;
+    }
+
+    try {
+      await config.setMinEditDistance(value);
+    } catch (error) {
+      ctx.ui.notify(`Failed to save minEditDistance: ${formatError(error)}`, "error");
+      return;
+    }
+
+    // minEditDistance is read live by the engine via getMinEditDistance(), so
+    // no rebuild is needed — the next correction picks up the new value.
+    ctx.ui.notify(`minEditDistance set to ${value}`, "info");
+  }
+
+  async function handleSetEditDistanceStepEvery(ctx: TyposCommandContext, raw: string): Promise<void> {
+    const value = parseIntInRange(raw, EDIT_DISTANCE_STEP_EVERY_RANGE);
+    if (value === undefined) {
+      ctx.ui.notify(
+        `Usage: /typos config editDistanceStepEvery <integer ${EDIT_DISTANCE_STEP_EVERY_RANGE.min}-${EDIT_DISTANCE_STEP_EVERY_RANGE.max}>`,
+        "warning",
+      );
+      return;
+    }
+
+    if (config.getEditDistanceStepEvery() === value) {
+      ctx.ui.notify(`editDistanceStepEvery is already ${value}`, "info");
+      return;
+    }
+
+    try {
+      await config.setEditDistanceStepEvery(value);
+    } catch (error) {
+      ctx.ui.notify(`Failed to save editDistanceStepEvery: ${formatError(error)}`, "error");
+      return;
+    }
+
+    // editDistanceStepEvery is read live by the engine via getEditDistanceStepEvery(), so
+    // no rebuild is needed — the next correction picks up the new value.
+    ctx.ui.notify(`editDistanceStepEvery set to ${value}`, "info");
   }
 
   async function handleSetMinWordLength(ctx: TyposCommandContext, raw: string): Promise<void> {
@@ -653,6 +909,62 @@ export function createTyposCommand({
   };
 }
 
+// ---------------------------------------------------------------------------
+// Pre-warm: kick off engine initialization before the first session_start
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the shared engine-construction options so {@link prewarmEngine} and
+ * {@link constructEngine} (inside createTyposCommand) always wire the same
+ * live-accessor knobs.
+ *
+ * This helper is NOT exported; consumers should call prewarmEngine().
+ */
+function buildEngineOptions(
+  techDictPath: string,
+  learnedDictionary: LearnedDictionary,
+  config: Config,
+): CorrectionEngineOptions {
+  return {
+    techDictPath,
+    isLearned: (word) => learnedDictionary.has(word),
+    maxEditDistance: config.getMaxEditDistance(),
+    getMinWordLength: () => config.getMinWordLength(),
+    getMinEditDistance: () => config.getMinEditDistance(),
+    getEditDistanceStepEvery: () => config.getEditDistanceStepEvery(),
+  };
+}
+
+/**
+ * Construct a {@link CorrectionEngine} and kick off its initialization in the
+ * background. The returned {@link PrewarmHandle} can be passed to
+ * {@link createTyposCommand} via the `prewarm` option so that the first
+ * `enable()` reuses the in-flight init rather than starting a second one.
+ *
+ * Errors on the init promise are silently captured via `.catch(() => undefined)`
+ * to prevent unhandled-rejection warnings. The engine's `readinessState` will
+ * transition to `"degraded"` on failure; the first `enable()` call detects
+ * that state and rebuilds from scratch (Section 5.6).
+ */
+export function prewarmEngine({
+  techDictPath,
+  learnedDictionary,
+  config,
+  createCorrectionEngine: factory = (opts) => new CorrectionEngine(opts),
+}: {
+  techDictPath: string;
+  learnedDictionary: LearnedDictionary;
+  config: Config;
+  createCorrectionEngine?: (options: CorrectionEngineOptions) => CorrectionEngine;
+}): PrewarmHandle {
+  const engine = factory(buildEngineOptions(techDictPath, learnedDictionary, config));
+  const initPromise = engine.initialize();
+  // Suppress unhandled-rejection before enable() has a chance to attach its
+  // own generation-guarded .catch callback via attachInitCallbacks().
+  void initPromise.catch(() => undefined);
+  return { engine, initPromise };
+}
+
 function isDefaultMode(value: string): value is DefaultMode {
   return value === "on" || value === "off";
 }
@@ -661,15 +973,23 @@ function isConfigKey(value: string): value is ConfigKey {
   return (CONFIG_KEYS as readonly string[]).includes(value);
 }
 
-function configValueChoices(key: string): readonly string[] | null {
+function configValueChoices(key: string, cfg: Config): readonly string[] | null {
   if (key === "defaultMode") {
     return DEFAULT_SUBCOMMANDS;
   }
   if (key === "maxEditDistance") {
-    return integerChoices(MAX_EDIT_DISTANCE_RANGE);
+    // Lower bound is dynamic: suggestions start at the current minEditDistance.
+    return integerChoices({ min: cfg.getMinEditDistance(), max: MAX_EDIT_DISTANCE_RANGE.max });
   }
   if (key === "minWordLength") {
     return integerChoices(MIN_WORD_LENGTH_RANGE);
+  }
+  if (key === "minEditDistance") {
+    // Upper bound is dynamic: suggestions cap at the current maxEditDistance.
+    return integerChoices({ min: MIN_EDIT_DISTANCE_RANGE_MIN, max: cfg.getMaxEditDistance() });
+  }
+  if (key === "editDistanceStepEvery") {
+    return integerChoices(EDIT_DISTANCE_STEP_EVERY_RANGE);
   }
   return null;
 }
