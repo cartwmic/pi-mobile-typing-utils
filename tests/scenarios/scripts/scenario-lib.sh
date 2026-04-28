@@ -11,7 +11,25 @@
 #   SCENARIO_PROVIDER  default: claude-bridge
 #   SCENARIO_MODEL     default: claude-bridge/claude-haiku-4-5
 #   SCENARIO_CWD       default: <repo root>
-#   SCENARIO_PI_ARGS   default: "--no-session -e ./dist/index.js"
+#   SCENARIO_PI_ARGS   default: "--no-session -ne -e ./index.ts -e <claude-bridge-path>"
+#                       Loads the local workspace's index.ts directly (Pi loads
+#                       TypeScript natively per package.json's pi.extensions),
+#                       disables auto-discovery so installed copies don't shadow
+#                       the workspace, and explicitly re-loads pi-claude-bridge
+#                       (resolved via `pi list`) since `-ne` would otherwise
+#                       block the `claude-bridge` provider used by SCENARIO_PROVIDER.
+#                       This is the equivalent of "pi dev-mode" for this repo:
+#                       the local code is the source of truth, with no risk of
+#                       running an outdated installed copy.
+#
+# Cache-dir isolation (added for Phase 12 telemetry scenarios):
+#   scn_setup() now exports SCN_CACHE_DIR="$OUT_DIR/<name>.cache" and
+#   scn_pi_start() passes MOBILE_AUTOCORRECT_CACHE_DIR='$SCN_CACHE_DIR' to
+#   the spawned Pi process inline, giving every scenario a private cache
+#   tree (trigram cache, telemetry NDJSON files, etc.).
+#
+# New helpers (Phase 12):
+#   scn_submit_typos_config <key> <value>  — submit /typos config <key> <value>
 #   SCENARIO_OUT_DIR   default: <repo>/.test-output/scenarios
 #
 # Completion-signal selection (for scn_send waits):
@@ -31,7 +49,21 @@ mkdir -p "$OUT_DIR"
 : "${SCENARIO_PROVIDER:=claude-bridge}"
 : "${SCENARIO_MODEL:=claude-bridge/claude-haiku-4-5}"
 : "${SCENARIO_CWD:=$REPO_DIR}"
-: "${SCENARIO_PI_ARGS:=--no-session -e ./dist/index.js}"
+# Resolve pi-claude-bridge's install path once (lazily) via `pi list`.
+if [[ -z "${SCN_CLAUDE_BRIDGE_PATH:-}" ]]; then
+	SCN_CLAUDE_BRIDGE_PATH="$(pi list 2>/dev/null | awk '/pi-claude-bridge$/{getline; gsub(/^[[:space:]]+/, ""); print}' | head -1)"
+	export SCN_CLAUDE_BRIDGE_PATH
+fi
+
+if [[ -n "${SCN_CLAUDE_BRIDGE_PATH}" && -f "${SCN_CLAUDE_BRIDGE_PATH}/index.ts" ]]; then
+	SCN_CLAUDE_BRIDGE_ENTRY="${SCN_CLAUDE_BRIDGE_PATH}/index.ts"
+elif [[ -n "${SCN_CLAUDE_BRIDGE_PATH}" && -f "${SCN_CLAUDE_BRIDGE_PATH}/dist/index.js" ]]; then
+	SCN_CLAUDE_BRIDGE_ENTRY="${SCN_CLAUDE_BRIDGE_PATH}/dist/index.js"
+else
+	SCN_CLAUDE_BRIDGE_ENTRY=""
+fi
+
+: "${SCENARIO_PI_ARGS:=--no-session -ne -e ./index.ts${SCN_CLAUDE_BRIDGE_ENTRY:+ -e ${SCN_CLAUDE_BRIDGE_ENTRY}}}"
 : "${SCN_PROVIDER_DEBUG_LOG:=}"
 : "${SCN_COMPLETION_SIGNAL_REGEX:=caching session=}"
 : "${SCN_IDLE_REGEX:=escape interrupt}"
@@ -59,6 +91,27 @@ scn_setup() {
 	export BRIDGE_LOG="$OUT_DIR/${name}.bridge.log"
 	export PANE_LOG="$OUT_DIR/${name}.pane.log"
 	export SCN_DICT_PATH="$OUT_DIR/${name}.dictionary.json"
+	export SCN_CACHE_DIR="$OUT_DIR/${name}.cache"
+	export SCN_CONFIG_PATH="$OUT_DIR/${name}.config.json"
+
+	# Pre-populate the per-scenario config file with `defaultMode: "on"` so the
+	# engine pre-warms during extension load. This avoids racing the toggle
+	# command's deferred-init callback against pi-coding-agent's ctx-staleness
+	# guard (which fires when `/typos on` triggers a fresh init that resolves
+	# AFTER the toggle handler's ctx has been invalidated). With a pre-warmed
+	# engine, `/typos on` takes the synchronous "already ready" branch and the
+	# init callbacks never run with a captured ctx.
+	mkdir -p "$(dirname "$SCN_CONFIG_PATH")"
+	cat > "$SCN_CONFIG_PATH" <<'JSON'
+{
+  "version": 1,
+  "defaultMode": "on",
+  "maxEditDistance": 2,
+  "minWordLength": 2,
+  "minEditDistance": 1,
+  "editDistanceStepEvery": 4
+}
+JSON
 	rm -f "$BRIDGE_LOG" "$PANE_LOG"
 	scn_reset_dict
 	# Honor user-set debug log path if explicitly given.
@@ -90,7 +143,7 @@ scn_pi_start() {
 	"${TMUX_CMD[@]}" set-option -g extended-keys on >/dev/null 2>&1 || true
 	"${TMUX_CMD[@]}" set-option -g extended-keys-format csi-u >/dev/null 2>&1 || true
 
-	local provider_env="MOBILE_AUTOCORRECT_DICT_PATH='$SCN_DICT_PATH'"
+	local provider_env="MOBILE_AUTOCORRECT_DICT_PATH='$SCN_DICT_PATH' MOBILE_AUTOCORRECT_CACHE_DIR='$SCN_CACHE_DIR' MOBILE_AUTOCORRECT_CONFIG_PATH='$SCN_CONFIG_PATH'"
 	if [[ "$SCENARIO_PROVIDER" == "claude-bridge" ]]; then
 		provider_env="$provider_env CLAUDE_BRIDGE_DEBUG=1 CLAUDE_BRIDGE_DEBUG_PATH='$BRIDGE_LOG'"
 	fi
@@ -512,6 +565,19 @@ scn_submit_typos_dict() {
 		sleep 0.5
 		scn_send_keys Enter
 	fi
+}
+
+scn_submit_typos_config() {
+	# scn_submit_typos_config <key> <value>
+	# Submit /typos config <key> <value>. Appends trailing space to cancel Pi's
+	# slash-command autocomplete, then double-Enter to execute (same pattern as
+	# scn_submit_typos_explicit_state).
+	local key="$1"
+	local value="$2"
+	scn_send_no_enter "/typos config $key $value "
+	sleep 0.5
+	scn_send_keys Enter Enter
+	sleep 0.3
 }
 
 scn_enable_autocorrect() {

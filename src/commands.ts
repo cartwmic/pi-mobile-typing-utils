@@ -1,3 +1,6 @@
+import { readdir, unlink } from "node:fs/promises";
+import { join } from "node:path";
+
 import type { ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { AutocompleteItem } from "@mariozechner/pi-tui";
 
@@ -7,23 +10,49 @@ import {
   MAX_EDIT_DISTANCE_RANGE,
   MIN_EDIT_DISTANCE_RANGE_MIN,
   MIN_WORD_LENGTH_RANGE,
+  RERANK_EDIT_DISTANCE_PENALTY_RANGE,
+  RERANK_WEIGHT_RANGE,
+  SEGMENTATION_LOG_PROB_FLOOR_RANGE,
+  SEGMENTATION_MAX_EDIT_DISTANCE_RANGE,
+  SEGMENTATION_MIN_LENGTH_RANGE,
+  SEGMENTATION_VS_LOOKUP_BIAS_RANGE,
+  TELEMETRY_LEVELS,
   type Config,
   type DefaultMode,
 } from "./config.js";
 import type { ReadinessState } from "./correction-engine.js";
 import { CorrectionEngine, type CorrectionEngineOptions } from "./correction-engine.js";
 import type { LearnedDictionary } from "./learned-dictionary.js";
+import type { TelemetryWriter } from "./telemetry.js";
+import { aggregateRange, type StatsRange } from "./telemetry-aggregate.js";
 
-const TOP_LEVEL_COMMANDS = ["on", "off", "dict", "default", "config"] as const;
+const TOP_LEVEL_COMMANDS = ["on", "off", "dict", "default", "config", "stats"] as const;
 const DICTIONARY_SUBCOMMANDS = ["add", "remove", "search", "clear"] as const;
 const DEFAULT_SUBCOMMANDS = ["on", "off"] as const;
-const CONFIG_KEYS = ["defaultMode", "maxEditDistance", "minWordLength", "minEditDistance", "editDistanceStepEvery"] as const;
+const CONFIG_KEYS = [
+  "defaultMode",
+  "maxEditDistance",
+  "minWordLength",
+  "minEditDistance",
+  "editDistanceStepEvery",
+  "enableSegmentation",
+  "segmentationMinLength",
+  "segmentationMaxEditDistance",
+  "segmentationLogProbFloor",
+  "segmentationVsLookupBias",
+  "enableContextRerank",
+  "rerankBigramWeight",
+  "rerankTrigramWeight",
+  "rerankEditDistancePenalty",
+  "telemetry",
+] as const;
+const STATS_SUBCOMMANDS = ["24h", "7d", "all", "reset"] as const;
 const DICTIONARY_WORD_PATTERN = /^[A-Za-z]+$/;
 const MAX_DICTIONARY_RESULTS = 50;
 const DICTIONARY_USAGE = "Usage: /typos dict [search <term>|add <word>|remove <word>|clear]";
 const DEFAULT_USAGE = "Usage: /typos default [on|off]";
 const CONFIG_USAGE = `Usage: /typos config [${CONFIG_KEYS.join("|")}] [<value>]`;
-const TOP_LEVEL_USAGE = "Unknown command. Usage: /typos [on|off|dict ...|default ...|config ...]";
+const TOP_LEVEL_USAGE = "Unknown command. Usage: /typos [on|off|dict ...|default ...|config ...|stats ...]";
 
 type ConfigKey = (typeof CONFIG_KEYS)[number];
 
@@ -57,6 +86,11 @@ export type TyposCommandState = {
    * matches ("orphan-promise generation guard", per design.md).
    */
   generation: number;
+  /**
+   * Timestamp (ms) of the first /typos stats reset invocation in a session.
+   * Null when no reset is pending. Per-process only; not persisted.
+   */
+  pendingResetAt: number | null;
 };
 
 /**
@@ -78,6 +112,16 @@ export type CreateTyposCommandOptions = {
    * {@link enable} reuses them rather than starting a second initialization.
    */
   prewarm?: PrewarmHandle;
+  /**
+   * Telemetry writer instance constructed once per process in index.ts.
+   * Optional — when absent (no cache dir or tests), telemetry is silently skipped.
+   */
+  telemetry?: TelemetryWriter;
+  /**
+   * Cache directory for resolving telemetry NDJSON files in /typos stats.
+   * When absent (cache disabled), /typos stats notifies the user.
+   */
+  cacheDir?: string;
   createCorrectionEngine?: (options: CorrectionEngineOptions) => CorrectionEngine;
   createAutocorrectEditor?: (...args: ConstructorParameters<typeof AutocorrectEditor>) => AutocorrectEditor;
 };
@@ -89,6 +133,8 @@ export function createTyposCommand({
   techDictPath,
   config,
   prewarm,
+  telemetry,
+  cacheDir,
   createCorrectionEngine = (options) => new CorrectionEngine(options),
   createAutocorrectEditor = (...args) => new AutocorrectEditor(...args),
 }: CreateTyposCommandOptions): {
@@ -108,6 +154,7 @@ export function createTyposCommand({
     generation: 0,
     engine: prewarm?.engine,
     initInFlight: prewarm?.initPromise,
+    pendingResetAt: null,
   };
 
   let inFlightAction: ScheduledAction | undefined;
@@ -162,6 +209,16 @@ export function createTyposCommand({
       return;
     }
 
+    if (trimmedArgs === "stats") {
+      await handleStatsCommand(ctx, "");
+      return;
+    }
+
+    if (trimmedArgs.startsWith("stats ")) {
+      await handleStatsCommand(ctx, trimmedArgs.slice(6));
+      return;
+    }
+
     ctx.ui.notify(TOP_LEVEL_USAGE, "warning");
   }
 
@@ -208,6 +265,14 @@ export function createTyposCommand({
         return null;
       }
       return buildKeyValueCompletions("config", key, valueChoices, valuePrefix);
+    }
+
+    if (prefix.startsWith("stats ")) {
+      const statsPrefix = prefix.slice(6).trimStart();
+      if (statsPrefix.includes(" ")) {
+        return null;
+      }
+      return buildSubcommandCompletions("stats", STATS_SUBCOMMANDS, statsPrefix);
     }
 
     return null;
@@ -302,7 +367,9 @@ export function createTyposCommand({
    * without a ctx, and have enable() attach callbacks later.
    */
   function constructEngine(): void {
-    const engine = createCorrectionEngine(buildEngineOptions(techDictPath, learnedDictionary, config));
+    const engine = createCorrectionEngine(
+      buildEngineOptions(techDictPath, learnedDictionary, config, telemetry, () => state.generation),
+    );
     state.engine = engine;
     state.initInFlight = engine.initialize();
   }
@@ -518,11 +585,21 @@ export function createTyposCommand({
 
   function showAllConfig(ctx: TyposCommandContext): void {
     const lines = [
-      `defaultMode      ${config.getDefaultMode()}`,
-      `maxEditDistance  ${config.getMaxEditDistance()}  (range ${MAX_EDIT_DISTANCE_RANGE.min}-${MAX_EDIT_DISTANCE_RANGE.max})`,
-      `minWordLength    ${config.getMinWordLength()}  (range ${MIN_WORD_LENGTH_RANGE.min}-${MIN_WORD_LENGTH_RANGE.max})`,
-      `minEditDistance  ${config.getMinEditDistance()}  (range ${MIN_EDIT_DISTANCE_RANGE_MIN}-${config.getMaxEditDistance()})`,
-      `editDistanceStepEvery  ${config.getEditDistanceStepEvery()}  (range ${EDIT_DISTANCE_STEP_EVERY_RANGE.min}-${EDIT_DISTANCE_STEP_EVERY_RANGE.max})`,
+      `defaultMode                ${config.getDefaultMode()}`,
+      `maxEditDistance            ${config.getMaxEditDistance()}  (range ${MAX_EDIT_DISTANCE_RANGE.min}-${MAX_EDIT_DISTANCE_RANGE.max})`,
+      `minWordLength              ${config.getMinWordLength()}  (range ${MIN_WORD_LENGTH_RANGE.min}-${MIN_WORD_LENGTH_RANGE.max})`,
+      `minEditDistance            ${config.getMinEditDistance()}  (range ${MIN_EDIT_DISTANCE_RANGE_MIN}-${config.getMaxEditDistance()})`,
+      `editDistanceStepEvery      ${config.getEditDistanceStepEvery()}  (range ${EDIT_DISTANCE_STEP_EVERY_RANGE.min}-${EDIT_DISTANCE_STEP_EVERY_RANGE.max})`,
+      `enableSegmentation         ${config.getEnableSegmentation()}`,
+      `segmentationMinLength      ${config.getSegmentationMinLength()}  (range ${SEGMENTATION_MIN_LENGTH_RANGE[0]}-${SEGMENTATION_MIN_LENGTH_RANGE[1]})`,
+      `segmentationMaxEditDistance  ${config.getSegmentationMaxEditDistance()}  (range ${SEGMENTATION_MAX_EDIT_DISTANCE_RANGE[0]}-${SEGMENTATION_MAX_EDIT_DISTANCE_RANGE[1]})`,
+      `segmentationLogProbFloor   ${config.getSegmentationLogProbFloor()}  (range ${SEGMENTATION_LOG_PROB_FLOOR_RANGE[0]}-${SEGMENTATION_LOG_PROB_FLOOR_RANGE[1]})`,
+      `segmentationVsLookupBias   ${config.getSegmentationVsLookupBias()}  (range ${SEGMENTATION_VS_LOOKUP_BIAS_RANGE[0]}-${SEGMENTATION_VS_LOOKUP_BIAS_RANGE[1]})`,
+      `enableContextRerank        ${config.getEnableContextRerank()}`,
+      `rerankBigramWeight         ${config.getRerankBigramWeight()}  (range ${RERANK_WEIGHT_RANGE[0]}-${RERANK_WEIGHT_RANGE[1]})`,
+      `rerankTrigramWeight        ${config.getRerankTrigramWeight()}  (range ${RERANK_WEIGHT_RANGE[0]}-${RERANK_WEIGHT_RANGE[1]})`,
+      `rerankEditDistancePenalty  ${config.getRerankEditDistancePenalty()}  (range ${RERANK_EDIT_DISTANCE_PENALTY_RANGE[0]}-${RERANK_EDIT_DISTANCE_PENALTY_RANGE[1]})`,
+      `telemetry                  ${config.getTelemetry()}`,
     ];
     ctx.ui.notify(`Mobile autocorrect config:\n${lines.join("\n")}`, "info");
   }
@@ -574,6 +651,56 @@ export function createTyposCommand({
       await handleSetEditDistanceStepEvery(ctx, remainder);
       return;
     }
+
+    if (key === "enableSegmentation") {
+      await handleSetEnableSegmentation(ctx, remainder);
+      return;
+    }
+
+    if (key === "segmentationMinLength") {
+      await handleSetSegmentationMinLength(ctx, remainder);
+      return;
+    }
+
+    if (key === "segmentationMaxEditDistance") {
+      await handleSetSegmentationMaxEditDistance(ctx, remainder);
+      return;
+    }
+
+    if (key === "segmentationLogProbFloor") {
+      await handleSetSegmentationLogProbFloor(ctx, remainder);
+      return;
+    }
+
+    if (key === "segmentationVsLookupBias") {
+      await handleSetSegmentationVsLookupBias(ctx, remainder);
+      return;
+    }
+
+    if (key === "enableContextRerank") {
+      await handleSetEnableContextRerank(ctx, remainder);
+      return;
+    }
+
+    if (key === "rerankBigramWeight") {
+      await handleSetRerankBigramWeight(ctx, remainder);
+      return;
+    }
+
+    if (key === "rerankTrigramWeight") {
+      await handleSetRerankTrigramWeight(ctx, remainder);
+      return;
+    }
+
+    if (key === "rerankEditDistancePenalty") {
+      await handleSetRerankEditDistancePenalty(ctx, remainder);
+      return;
+    }
+
+    if (key === "telemetry") {
+      await handleSetTelemetry(ctx, remainder);
+      return;
+    }
   }
 
   function showSingleConfig(ctx: TyposCommandContext, key: ConfigKey): void {
@@ -604,6 +731,57 @@ export function createTyposCommand({
           `editDistanceStepEvery = ${config.getEditDistanceStepEvery()} (range ${EDIT_DISTANCE_STEP_EVERY_RANGE.min}-${EDIT_DISTANCE_STEP_EVERY_RANGE.max})`,
           "info",
         );
+        return;
+      case "enableSegmentation":
+        ctx.ui.notify(`enableSegmentation = ${config.getEnableSegmentation()}`, "info");
+        return;
+      case "segmentationMinLength":
+        ctx.ui.notify(
+          `segmentationMinLength = ${config.getSegmentationMinLength()} (range ${SEGMENTATION_MIN_LENGTH_RANGE[0]}-${SEGMENTATION_MIN_LENGTH_RANGE[1]})`,
+          "info",
+        );
+        return;
+      case "segmentationMaxEditDistance":
+        ctx.ui.notify(
+          `segmentationMaxEditDistance = ${config.getSegmentationMaxEditDistance()} (range ${SEGMENTATION_MAX_EDIT_DISTANCE_RANGE[0]}-${SEGMENTATION_MAX_EDIT_DISTANCE_RANGE[1]})`,
+          "info",
+        );
+        return;
+      case "segmentationLogProbFloor":
+        ctx.ui.notify(
+          `segmentationLogProbFloor = ${config.getSegmentationLogProbFloor()} (range ${SEGMENTATION_LOG_PROB_FLOOR_RANGE[0]}-${SEGMENTATION_LOG_PROB_FLOOR_RANGE[1]})`,
+          "info",
+        );
+        return;
+      case "segmentationVsLookupBias":
+        ctx.ui.notify(
+          `segmentationVsLookupBias = ${config.getSegmentationVsLookupBias()} (range ${SEGMENTATION_VS_LOOKUP_BIAS_RANGE[0]}-${SEGMENTATION_VS_LOOKUP_BIAS_RANGE[1]})`,
+          "info",
+        );
+        return;
+      case "enableContextRerank":
+        ctx.ui.notify(`enableContextRerank = ${config.getEnableContextRerank()}`, "info");
+        return;
+      case "rerankBigramWeight":
+        ctx.ui.notify(
+          `rerankBigramWeight = ${config.getRerankBigramWeight()} (range ${RERANK_WEIGHT_RANGE[0]}-${RERANK_WEIGHT_RANGE[1]})`,
+          "info",
+        );
+        return;
+      case "rerankTrigramWeight":
+        ctx.ui.notify(
+          `rerankTrigramWeight = ${config.getRerankTrigramWeight()} (range ${RERANK_WEIGHT_RANGE[0]}-${RERANK_WEIGHT_RANGE[1]})`,
+          "info",
+        );
+        return;
+      case "rerankEditDistancePenalty":
+        ctx.ui.notify(
+          `rerankEditDistancePenalty = ${config.getRerankEditDistancePenalty()} (range ${RERANK_EDIT_DISTANCE_PENALTY_RANGE[0]}-${RERANK_EDIT_DISTANCE_PENALTY_RANGE[1]})`,
+          "info",
+        );
+        return;
+      case "telemetry":
+        ctx.ui.notify(`telemetry = ${config.getTelemetry()}`, "info");
         return;
     }
   }
@@ -736,6 +914,355 @@ export function createTyposCommand({
     // minWordLength is read live by the engine via getMinWordLength(), so
     // no rebuild is needed — the next correction picks up the new value.
     ctx.ui.notify(`minWordLength set to ${value}`, "info");
+  }
+
+  // ---------------------------------------------------------------------------
+  // New live-applied config key handlers (§11.2)
+  // ---------------------------------------------------------------------------
+
+  async function handleSetEnableSegmentation(ctx: TyposCommandContext, raw: string): Promise<void> {
+    const value = parseBoolean(raw);
+    if (value === undefined) {
+      ctx.ui.notify("Usage: /typos config enableSegmentation <true|false>", "warning");
+      return;
+    }
+    if (config.getEnableSegmentation() === value) {
+      ctx.ui.notify(`enableSegmentation is already ${value}`, "info");
+      return;
+    }
+    try {
+      await config.setEnableSegmentation(value);
+    } catch (error) {
+      ctx.ui.notify(`Failed to save enableSegmentation: ${formatError(error)}`, "error");
+      return;
+    }
+    ctx.ui.notify(`enableSegmentation set to ${value}`, "info");
+  }
+
+  async function handleSetSegmentationMinLength(ctx: TyposCommandContext, raw: string): Promise<void> {
+    const value = parseIntInRange(raw, {
+      min: SEGMENTATION_MIN_LENGTH_RANGE[0],
+      max: SEGMENTATION_MIN_LENGTH_RANGE[1],
+    });
+    if (value === undefined) {
+      ctx.ui.notify(
+        `Usage: /typos config segmentationMinLength <integer ${SEGMENTATION_MIN_LENGTH_RANGE[0]}-${SEGMENTATION_MIN_LENGTH_RANGE[1]}>`,
+        "warning",
+      );
+      return;
+    }
+    if (config.getSegmentationMinLength() === value) {
+      ctx.ui.notify(`segmentationMinLength is already ${value}`, "info");
+      return;
+    }
+    try {
+      await config.setSegmentationMinLength(value);
+    } catch (error) {
+      ctx.ui.notify(`Failed to save segmentationMinLength: ${formatError(error)}`, "error");
+      return;
+    }
+    ctx.ui.notify(`segmentationMinLength set to ${value}`, "info");
+  }
+
+  async function handleSetSegmentationMaxEditDistance(
+    ctx: TyposCommandContext,
+    raw: string,
+  ): Promise<void> {
+    const value = parseIntInRange(raw, {
+      min: SEGMENTATION_MAX_EDIT_DISTANCE_RANGE[0],
+      max: SEGMENTATION_MAX_EDIT_DISTANCE_RANGE[1],
+    });
+    if (value === undefined) {
+      ctx.ui.notify(
+        `Usage: /typos config segmentationMaxEditDistance <integer ${SEGMENTATION_MAX_EDIT_DISTANCE_RANGE[0]}-${SEGMENTATION_MAX_EDIT_DISTANCE_RANGE[1]}>`,
+        "warning",
+      );
+      return;
+    }
+    if (config.getSegmentationMaxEditDistance() === value) {
+      ctx.ui.notify(`segmentationMaxEditDistance is already ${value}`, "info");
+      return;
+    }
+    try {
+      await config.setSegmentationMaxEditDistance(value);
+    } catch (error) {
+      ctx.ui.notify(`Failed to save segmentationMaxEditDistance: ${formatError(error)}`, "error");
+      return;
+    }
+    ctx.ui.notify(`segmentationMaxEditDistance set to ${value}`, "info");
+  }
+
+  async function handleSetSegmentationLogProbFloor(
+    ctx: TyposCommandContext,
+    raw: string,
+  ): Promise<void> {
+    const value = parseNumberInRange(raw, [
+      SEGMENTATION_LOG_PROB_FLOOR_RANGE[0],
+      SEGMENTATION_LOG_PROB_FLOOR_RANGE[1],
+    ]);
+    if (value === undefined) {
+      ctx.ui.notify(
+        `Usage: /typos config segmentationLogProbFloor <number ${SEGMENTATION_LOG_PROB_FLOOR_RANGE[0]}-${SEGMENTATION_LOG_PROB_FLOOR_RANGE[1]}>`,
+        "warning",
+      );
+      return;
+    }
+    if (config.getSegmentationLogProbFloor() === value) {
+      ctx.ui.notify(`segmentationLogProbFloor is already ${value}`, "info");
+      return;
+    }
+    try {
+      await config.setSegmentationLogProbFloor(value);
+    } catch (error) {
+      ctx.ui.notify(`Failed to save segmentationLogProbFloor: ${formatError(error)}`, "error");
+      return;
+    }
+    ctx.ui.notify(`segmentationLogProbFloor set to ${value}`, "info");
+  }
+
+  async function handleSetSegmentationVsLookupBias(
+    ctx: TyposCommandContext,
+    raw: string,
+  ): Promise<void> {
+    const value = parseNumberInRange(raw, [
+      SEGMENTATION_VS_LOOKUP_BIAS_RANGE[0],
+      SEGMENTATION_VS_LOOKUP_BIAS_RANGE[1],
+    ]);
+    if (value === undefined) {
+      ctx.ui.notify(
+        `Usage: /typos config segmentationVsLookupBias <number ${SEGMENTATION_VS_LOOKUP_BIAS_RANGE[0]}-${SEGMENTATION_VS_LOOKUP_BIAS_RANGE[1]}>`,
+        "warning",
+      );
+      return;
+    }
+    if (config.getSegmentationVsLookupBias() === value) {
+      ctx.ui.notify(`segmentationVsLookupBias is already ${value}`, "info");
+      return;
+    }
+    try {
+      await config.setSegmentationVsLookupBias(value);
+    } catch (error) {
+      ctx.ui.notify(`Failed to save segmentationVsLookupBias: ${formatError(error)}`, "error");
+      return;
+    }
+    ctx.ui.notify(`segmentationVsLookupBias set to ${value}`, "info");
+  }
+
+  async function handleSetEnableContextRerank(
+    ctx: TyposCommandContext,
+    raw: string,
+  ): Promise<void> {
+    const value = parseBoolean(raw);
+    if (value === undefined) {
+      ctx.ui.notify("Usage: /typos config enableContextRerank <true|false>", "warning");
+      return;
+    }
+    if (config.getEnableContextRerank() === value) {
+      ctx.ui.notify(`enableContextRerank is already ${value}`, "info");
+      return;
+    }
+    try {
+      await config.setEnableContextRerank(value);
+    } catch (error) {
+      ctx.ui.notify(`Failed to save enableContextRerank: ${formatError(error)}`, "error");
+      return;
+    }
+    ctx.ui.notify(`enableContextRerank set to ${value}`, "info");
+  }
+
+  async function handleSetRerankBigramWeight(
+    ctx: TyposCommandContext,
+    raw: string,
+  ): Promise<void> {
+    const value = parseNumberInRange(raw, [RERANK_WEIGHT_RANGE[0], RERANK_WEIGHT_RANGE[1]]);
+    if (value === undefined) {
+      ctx.ui.notify(
+        `Usage: /typos config rerankBigramWeight <number ${RERANK_WEIGHT_RANGE[0]}-${RERANK_WEIGHT_RANGE[1]}>`,
+        "warning",
+      );
+      return;
+    }
+    if (config.getRerankBigramWeight() === value) {
+      ctx.ui.notify(`rerankBigramWeight is already ${value}`, "info");
+      return;
+    }
+    try {
+      await config.setRerankBigramWeight(value);
+    } catch (error) {
+      ctx.ui.notify(`Failed to save rerankBigramWeight: ${formatError(error)}`, "error");
+      return;
+    }
+    ctx.ui.notify(`rerankBigramWeight set to ${value}`, "info");
+  }
+
+  async function handleSetRerankTrigramWeight(
+    ctx: TyposCommandContext,
+    raw: string,
+  ): Promise<void> {
+    const value = parseNumberInRange(raw, [RERANK_WEIGHT_RANGE[0], RERANK_WEIGHT_RANGE[1]]);
+    if (value === undefined) {
+      ctx.ui.notify(
+        `Usage: /typos config rerankTrigramWeight <number ${RERANK_WEIGHT_RANGE[0]}-${RERANK_WEIGHT_RANGE[1]}>`,
+        "warning",
+      );
+      return;
+    }
+    if (config.getRerankTrigramWeight() === value) {
+      ctx.ui.notify(`rerankTrigramWeight is already ${value}`, "info");
+      return;
+    }
+    try {
+      await config.setRerankTrigramWeight(value);
+    } catch (error) {
+      ctx.ui.notify(`Failed to save rerankTrigramWeight: ${formatError(error)}`, "error");
+      return;
+    }
+    ctx.ui.notify(`rerankTrigramWeight set to ${value}`, "info");
+  }
+
+  async function handleSetRerankEditDistancePenalty(
+    ctx: TyposCommandContext,
+    raw: string,
+  ): Promise<void> {
+    const value = parseNumberInRange(raw, [
+      RERANK_EDIT_DISTANCE_PENALTY_RANGE[0],
+      RERANK_EDIT_DISTANCE_PENALTY_RANGE[1],
+    ]);
+    if (value === undefined) {
+      ctx.ui.notify(
+        `Usage: /typos config rerankEditDistancePenalty <number ${RERANK_EDIT_DISTANCE_PENALTY_RANGE[0]}-${RERANK_EDIT_DISTANCE_PENALTY_RANGE[1]}>`,
+        "warning",
+      );
+      return;
+    }
+    if (config.getRerankEditDistancePenalty() === value) {
+      ctx.ui.notify(`rerankEditDistancePenalty is already ${value}`, "info");
+      return;
+    }
+    try {
+      await config.setRerankEditDistancePenalty(value);
+    } catch (error) {
+      ctx.ui.notify(`Failed to save rerankEditDistancePenalty: ${formatError(error)}`, "error");
+      return;
+    }
+    ctx.ui.notify(`rerankEditDistancePenalty set to ${value}`, "info");
+  }
+
+  async function handleSetTelemetry(ctx: TyposCommandContext, raw: string): Promise<void> {
+    const trimmed = raw.trim();
+    if (!(TELEMETRY_LEVELS as readonly string[]).includes(trimmed)) {
+      ctx.ui.notify(
+        `Usage: /typos config telemetry <${TELEMETRY_LEVELS.join("|")}>`,
+        "warning",
+      );
+      return;
+    }
+    const level = trimmed as (typeof TELEMETRY_LEVELS)[number];
+    if (config.getTelemetry() === level) {
+      ctx.ui.notify(`telemetry is already ${level}`, "info");
+      return;
+    }
+    try {
+      await config.setTelemetry(level);
+    } catch (error) {
+      ctx.ui.notify(`Failed to save telemetry: ${formatError(error)}`, "error");
+      return;
+    }
+    ctx.ui.notify(`telemetry set to ${level}`, "info");
+  }
+
+  // ---------------------------------------------------------------------------
+  // /typos stats handler (§11.6, 11.7, 11.8)
+  // ---------------------------------------------------------------------------
+
+  async function handleStatsCommand(ctx: TyposCommandContext, rawArgs: string): Promise<void> {
+    const arg = rawArgs.trim();
+
+    if (arg === "reset") {
+      await handleStatsReset(ctx);
+      return;
+    }
+
+    const range: StatsRange = arg === "7d" ? "7d" : arg === "all" ? "all" : "24h";
+
+    const telemetryDir = cacheDir ? join(cacheDir, "telemetry") : null;
+    if (!telemetryDir) {
+      ctx.ui.notify("Telemetry disabled (no cache directory)", "info");
+      return;
+    }
+
+    try {
+      const report = await aggregateRange(telemetryDir, range);
+      ctx.ui.notify(report.formatted, "info");
+    } catch (error) {
+      ctx.ui.notify(`Failed to read telemetry: ${formatError(error)}`, "error");
+    }
+  }
+
+  async function handleStatsReset(ctx: TyposCommandContext): Promise<void> {
+    const telemetryDir = cacheDir ? join(cacheDir, "telemetry") : null;
+    if (!telemetryDir) {
+      ctx.ui.notify("Telemetry disabled (no cache directory)", "info");
+      return;
+    }
+
+    const now = Date.now();
+
+    if (state.pendingResetAt === null) {
+      // First invocation: prompt for confirmation
+      state.pendingResetAt = now;
+      ctx.ui.notify(
+        "Run /typos stats reset again within 30 seconds to delete all telemetry NDJSON files.",
+        "warning",
+      );
+      return;
+    }
+
+    const elapsed = now - state.pendingResetAt;
+
+    if (elapsed > 30000) {
+      // Stale confirmation: re-prompt
+      state.pendingResetAt = now;
+      ctx.ui.notify(
+        "Run /typos stats reset again within 30 seconds to delete all telemetry NDJSON files.",
+        "warning",
+      );
+      return;
+    }
+
+    // Valid confirmation window: delete files
+    state.pendingResetAt = null;
+
+    let files: string[];
+    try {
+      const entries = await readdir(telemetryDir);
+      files = entries.filter((f) => /^events-.*\.ndjson$/.test(f));
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") {
+        ctx.ui.notify("No telemetry to reset", "info");
+        return;
+      }
+      ctx.ui.notify(`Failed to list telemetry files: ${formatError(error)}`, "error");
+      return;
+    }
+
+    if (files.length === 0) {
+      ctx.ui.notify("No telemetry to reset", "info");
+      return;
+    }
+
+    let deleted = 0;
+    for (const file of files) {
+      try {
+        await unlink(join(telemetryDir, file));
+        deleted++;
+      } catch {
+        // Best-effort; swallow per-file errors
+      }
+    }
+
+    ctx.ui.notify(`Telemetry reset: deleted ${deleted} files.`, "info");
   }
 
   async function handleDictionaryCommand(ctx: TyposCommandContext, rawArgs: string): Promise<void> {
@@ -924,6 +1451,8 @@ function buildEngineOptions(
   techDictPath: string,
   learnedDictionary: LearnedDictionary,
   config: Config,
+  telemetry?: TelemetryWriter,
+  getOwnerGeneration?: () => number,
 ): CorrectionEngineOptions {
   return {
     techDictPath,
@@ -932,6 +1461,17 @@ function buildEngineOptions(
     getMinWordLength: () => config.getMinWordLength(),
     getMinEditDistance: () => config.getMinEditDistance(),
     getEditDistanceStepEvery: () => config.getEditDistanceStepEvery(),
+    getEnableSegmentation: () => config.getEnableSegmentation(),
+    getSegmentationMinLength: () => config.getSegmentationMinLength(),
+    getSegmentationMaxEditDistance: () => config.getSegmentationMaxEditDistance(),
+    getSegmentationLogProbFloor: () => config.getSegmentationLogProbFloor(),
+    getSegmentationVsLookupBias: () => config.getSegmentationVsLookupBias(),
+    getEnableContextRerank: () => config.getEnableContextRerank(),
+    getRerankBigramWeight: () => config.getRerankBigramWeight(),
+    getRerankTrigramWeight: () => config.getRerankTrigramWeight(),
+    getRerankEditDistancePenalty: () => config.getRerankEditDistancePenalty(),
+    getOwnerGeneration: getOwnerGeneration ?? (() => 0),
+    telemetry,
   };
 }
 
@@ -950,14 +1490,20 @@ export function prewarmEngine({
   techDictPath,
   learnedDictionary,
   config,
+  telemetry,
   createCorrectionEngine: factory = (opts) => new CorrectionEngine(opts),
 }: {
   techDictPath: string;
   learnedDictionary: LearnedDictionary;
   config: Config;
+  /** Optional writer from index.ts; pre-warm engine emits engine.init via this. */
+  telemetry?: TelemetryWriter;
   createCorrectionEngine?: (options: CorrectionEngineOptions) => CorrectionEngine;
 }): PrewarmHandle {
-  const engine = factory(buildEngineOptions(techDictPath, learnedDictionary, config));
+  // Pre-warm has no state.generation reference — use () => 0 as documented in
+  // design.md Decision 7. The pre-warm engine is the FIRST one; its trigram
+  // attach won't be orphaned because no rebuild has happened yet.
+  const engine = factory(buildEngineOptions(techDictPath, learnedDictionary, config, telemetry, () => 0));
   const initPromise = engine.initialize();
   // Suppress unhandled-rejection before enable() has a chance to attach its
   // own generation-guarded .catch callback via attachInitCallbacks().
@@ -991,6 +1537,22 @@ function configValueChoices(key: string, cfg: Config): readonly string[] | null 
   if (key === "editDistanceStepEvery") {
     return integerChoices(EDIT_DISTANCE_STEP_EVERY_RANGE);
   }
+  if (key === "enableSegmentation" || key === "enableContextRerank") {
+    return ["true", "false"];
+  }
+  if (key === "telemetry") {
+    return [...TELEMETRY_LEVELS];
+  }
+  if (key === "segmentationMinLength") {
+    return integerChoices({ min: SEGMENTATION_MIN_LENGTH_RANGE[0], max: SEGMENTATION_MIN_LENGTH_RANGE[1] });
+  }
+  if (key === "segmentationMaxEditDistance") {
+    return integerChoices({
+      min: SEGMENTATION_MAX_EDIT_DISTANCE_RANGE[0],
+      max: SEGMENTATION_MAX_EDIT_DISTANCE_RANGE[1],
+    });
+  }
+  // Free-form numeric keys: no suggestions
   return null;
 }
 
@@ -1012,6 +1574,22 @@ function parseIntInRange(raw: string, range: { min: number; max: number }): numb
     return undefined;
   }
   return parsed;
+}
+
+function parseNumberInRange(raw: string, range: [number, number]): number | undefined {
+  const trimmed = raw.trim();
+  const parsed = Number(trimmed);
+  if (Number.isNaN(parsed) || parsed < range[0] || parsed > range[1]) {
+    return undefined;
+  }
+  return parsed;
+}
+
+function parseBoolean(raw: string): boolean | undefined {
+  const trimmed = raw.trim();
+  if (trimmed === "true") return true;
+  if (trimmed === "false") return false;
+  return undefined;
 }
 
 function buildKeyValueCompletions(

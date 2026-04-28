@@ -153,7 +153,7 @@ describe("9.5.2 — second init uses cache; unigram loader not called", () => {
 
       expect(spy).not.toHaveBeenCalled();
       expect(engine2.getReadinessState()).toBe("ready");
-      expect(engine2.shouldCorrect("teh")).toEqual({ corrected: true, suggestion: "the" });
+      expect(engine2.shouldCorrect("teh")).toEqual({ corrected: true, kind: "lookup", suggestion: "the" });
     },
     30_000,
   );
@@ -183,7 +183,7 @@ describe("9.5.3 — corrupted cache falls back to fresh build", () => {
       expect(engine.getReadinessState()).toBe("ready");
       // Fresh build must have run exactly once.
       expect(spy).toHaveBeenCalledOnce();
-      expect(engine.shouldCorrect("teh")).toEqual({ corrected: true, suggestion: "the" });
+      expect(engine.shouldCorrect("teh")).toEqual({ corrected: true, kind: "lookup", suggestion: "the" });
     },
     30_000,
   );
@@ -293,7 +293,7 @@ describe("9.5.6 — cache write failure does not block readiness", () => {
       await engine.initialize();
 
       expect(engine.getReadinessState()).toBe("ready");
-      expect(engine.shouldCorrect("teh")).toEqual({ corrected: true, suggestion: "the" });
+      expect(engine.shouldCorrect("teh")).toEqual({ corrected: true, kind: "lookup", suggestion: "the" });
       expect(spy).toHaveBeenCalled();
     },
     30_000,

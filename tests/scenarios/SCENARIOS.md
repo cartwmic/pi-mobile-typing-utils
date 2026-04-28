@@ -189,6 +189,50 @@ Each scenario follows the canonical `pi-tui-scenario-tests` pattern in condensed
 - **Mechanical assertions:** pre-submit pane shows the original tech terms.
 - **Coherence probe:** response contains `kubectl` and `nginx` and does not contain `cuddle` or `engine`.
 
+## Group F — Context rerank, segmentation, telemetry
+
+### T26 — Word segmentation, classic concatenation
+- **Goal:** prove the segmentation engine splits an unambiguous run-together compound into its constituent words when typed in the editor.
+- **Steps:** start Pi, `/typos on`, type `thequick `.
+- **Mechanical assertions:** pane contains `the quick` and does not contain the orphan `thequick `.
+- **Coherence probe:** none (pre-submit).
+
+### T27 — Word segmentation, edit-distance knob behavior
+- **Goal:** prove `/typos config segmentationMaxEditDistance` is settable and that ED=0 suppresses fuzzy-match segmentation while ED=1 leaves behavior defined by corpus log-prob.
+- **Steps:** start Pi, `/typos on`; set `segmentationMaxEditDistance` to `0`; type `wantto `; assert input present. Then set it to `1`; clear editor; type `wantto `; accept either the original or the split form.
+- **Mechanical assertions:** at ED=0 pane contains `wantto`; at ED=1 pane contains `wantto` or `want to` (both acceptable — corpus-dependent).
+- **Coherence probe:** none (pre-submit).
+
+### T28 — Segmentation rejection, below minimum length
+- **Goal:** prove the `segmentationMinLength` gate (default 6) prevents segmentation of short tokens.
+- **Steps:** start Pi, `/typos on`, type `imho ` (4 chars).
+- **Mechanical assertions:** pane contains `imho` and the token is not split.
+- **Coherence probe:** none (pre-submit).
+
+### T29 — Segmentation respects the learned dictionary
+- **Goal:** prove that two user rejections cause the engine to learn a token, after which the learned-dictionary gate suppresses re-segmentation on the third occurrence.
+- **Steps:** start Pi, `/typos on`; type `thequick ` and Backspace (first rejection); type `thequick ` at a new position and Backspace (second rejection, triggers learning); type `thequick ` a third time.
+- **Mechanical assertions:** `Learned: thequick` notification appears after the second rejection; the isolated dictionary file contains `"thequick"`; the pane contains `thequick` after the third type (no segmentation).
+- **Coherence probe:** none (pre-submit).
+
+### T32 — Telemetry metrics file written by default
+- **Goal:** prove the default telemetry level (`"metrics"`) writes an NDJSON events file on each correction and that content fields such as `token` are masked at that level.
+- **Steps:** start Pi in an isolated `MOBILE_AUTOCORRECT_CACHE_DIR`, `/typos on`, type `teh `; wait for the async write to flush.
+- **Mechanical assertions:** `<cacheDir>/telemetry/events-*.ndjson` exists; the file contains a line matching `"event":"correction.applied"`; that line does NOT contain `"token":"teh"` (metrics masking).
+- **Coherence probe:** none (pre-submit).
+
+### T33 — Telemetry off writes nothing
+- **Goal:** prove that setting `telemetry` to `"off"` before enabling autocorrect prevents any telemetry directory or NDJSON file from being created.
+- **Steps:** start Pi in an isolated `MOBILE_AUTOCORRECT_CACHE_DIR`; `/typos config telemetry off`; `/typos on`; type `teh `; wait.
+- **Mechanical assertions:** `<cacheDir>/telemetry/` does not exist; no `events-*.ndjson` file is found anywhere under the cache directory.
+- **Coherence probe:** none (pre-submit).
+
+### T34 — `/typos stats` summary renders
+- **Goal:** prove the `/typos stats` slash command aggregates the telemetry NDJSON files and displays a formatted summary in the Pi pane.
+- **Steps:** start Pi in an isolated `MOBILE_AUTOCORRECT_CACHE_DIR`, `/typos on`; fire ~10 corrections using `scn_type_and_settle` with common misspellings; wait for async writes; submit `/typos stats`.
+- **Mechanical assertions:** pane contains `Mobile autocorrect telemetry summary` (the heading locked in `src/telemetry-aggregate.ts`); pane contains `corrections applied:`.
+- **Coherence probe:** none (pre-submit).
+
 ## Running
 
 Run the full suite:
@@ -232,6 +276,20 @@ bash tests/scenarios/scripts/run-scenario-t01.sh
 | T23 | PASS | |
 | T24 | PASS | Corrected draft verified in editor and echoed correctly by the model. |
 | T25 | PASS | Tech terms preserved in editor and model response. |
+| T26 | PENDING | Smoke-run deferred to user (requires live Pi + credentials). |
+| T27 | PENDING | Knob-behavior test; corpus-dependent outcome. Smoke-run deferred. |
+| T28 | PENDING | Smoke-run deferred to user. |
+| T29 | PENDING | Smoke-run deferred to user. |
+| T32 | PENDING | Smoke-run deferred to user. |
+| T33 | PENDING | Smoke-run deferred to user. |
+| T34 | PENDING | Smoke-run deferred to user. |
+
+## Known issues / TODO (Phase 12 additions)
+
+- **T27 is intentionally corpus-soft:** at `segmentationMaxEditDistance: 1` the outcome for `wantto` depends on the corpus log-probability of `want to` vs. `wantto`. Both the original and the split form are accepted. The test validates the config knob is settable and Pi remains stable, not a specific correction.
+- **T29 timing:** the `Learned: thequick` notification must appear within 5 seconds of the second Backspace. On very slow CI machines this window may need widening.
+- **T32 sleep(3):** telemetry is fire-and-forget; the 3-second sleep after correction is a conservative flush window. On heavily loaded systems a longer sleep may be needed.
+- **T34 requires at least one correction to fire:** if none of the ~10 fixture words are in the symspell-ts dictionary, `corrections applied: 0` still appears and the assertion passes (the line exists regardless of count).
 
 ## Known issues / TODO
 

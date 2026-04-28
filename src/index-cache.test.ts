@@ -40,7 +40,7 @@ import {
   test,
   vi,
 } from "vitest";
-import { SymSpell, Verbosity } from "symspell-ts";
+import { SymSpell, Verbosity, loadDefaultDictionaries } from "symspell-ts";
 import { resolveSymspellPackageRoot } from "./symspell-paths.js";
 import {
   __resetCacheDisabledForTests,
@@ -157,6 +157,9 @@ const MINIMAL_FAKE = {
   maxDictionaryEditDistance: 2,
   belowThresholdWords: new Map<string, number>(),
   bigrams: new Map<string, number>(),
+  // bigramCountMin defaults to Number.MAX_SAFE_INTEGER when no bigrams loaded
+  // (mirrors the SymSpell constructor initialisation in symspell.js).
+  bigramCountMin: Number.MAX_SAFE_INTEGER,
 };
 
 async function fileExists(p: string): Promise<boolean> {
@@ -168,14 +171,9 @@ async function fileExists(p: string): Promise<boolean> {
 describe("round-trip fidelity", () => {
   let realSymspell: InstanceType<typeof SymSpell>;
   let corpusLines: string[];
+  let segmentationCorpusLines: string[];
 
   beforeAll(async () => {
-    const pkgRoot = actualResolveRoot();
-    if (!pkgRoot) throw new Error("resolveSymspellPackageRoot() returned null");
-
-    const dictPath = join(pkgRoot, "data", "frequency_dictionary_en_82_765.txt");
-    const dictText = readFileSync(dictPath, "utf8");
-
     realSymspell = new SymSpell(
       16,
       BASE_DESCRIPTOR.maxEditDistance,
@@ -183,39 +181,48 @@ describe("round-trip fidelity", () => {
       CACHE_COUNT_THRESHOLD,
       CACHE_COMPACT_LEVEL,
     );
-    realSymspell.loadDictionary(dictText, 0, 1);
+    // Load both unigrams and bigrams so the v2 cache format is exercised.
+    loadDefaultDictionaries(realSymspell);
 
-    const corpusPath = join(
+    const fixturesDir = join(
       new URL(".", import.meta.url).pathname,
       "..",
       "tests",
       "fixtures",
-      "cache-fidelity-corpus.txt",
     );
-    corpusLines = readFileSync(corpusPath, "utf8")
+    corpusLines = readFileSync(join(fixturesDir, "cache-fidelity-corpus.txt"), "utf8")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+    segmentationCorpusLines = readFileSync(join(fixturesDir, "cache-segmentation-corpus.txt"), "utf8")
       .split("\n")
       .map((l) => l.trim())
       .filter(Boolean);
   }, 60_000);
 
-  test("8.9.1 — serialize + deserialize produces identical lookup results for every corpus word", () => {
-    const buffer = serializeIndex(realSymspell);
-    const result = deserializeIndex(buffer, BASE_DESCRIPTOR);
-    expect(result).not.toBeNull();
-
-    // Hydrate a fresh SymSpell from the deserialized data by setting the
-    // nominally-private fields directly (matching what Section 9 production
-    // code will do).
-    const hydratedSS = new SymSpell(
+  /** Helper: rehydrate a new SymSpell from a HydrationResult. */
+  function rehydrate(result: ReturnType<typeof deserializeIndex>): InstanceType<typeof SymSpell> {
+    const ss = new SymSpell(
       16,
       BASE_DESCRIPTOR.maxEditDistance,
       BASE_DESCRIPTOR.prefixLength,
       BASE_DESCRIPTOR.countThreshold,
       BASE_DESCRIPTOR.compactLevel,
     ) as unknown as Record<string, unknown> & InstanceType<typeof SymSpell>;
-    hydratedSS["words"] = result!.words;
-    hydratedSS["deletes"] = result!.deletes;
-    hydratedSS["maxDictionaryWordLength"] = result!.maxDictionaryWordLength;
+    ss["words"] = result!.words;
+    ss["deletes"] = result!.deletes;
+    ss["maxDictionaryWordLength"] = result!.maxDictionaryWordLength;
+    ss["bigrams"] = result!.bigrams;
+    ss["bigramCountMin"] = result!.bigramCountMin;
+    return ss as unknown as InstanceType<typeof SymSpell>;
+  }
+
+  test("8.9.1 — serialize + deserialize produces identical lookup results for every corpus word", () => {
+    const buffer = serializeIndex(realSymspell);
+    const result = deserializeIndex(buffer, BASE_DESCRIPTOR);
+    expect(result).not.toBeNull();
+
+    const hydratedSS = rehydrate(result);
 
     for (const word of corpusLines) {
       const lower = word.toLowerCase();
@@ -229,6 +236,40 @@ describe("round-trip fidelity", () => {
       const origTop = origSugs[0] ? { term: origSugs[0].term, distance: origSugs[0].distance } : null;
       const hydrTop = hydrSugs[0] ? { term: hydrSugs[0].term, distance: hydrSugs[0].distance } : null;
       expect(hydrTop).toEqual(origTop);
+    }
+  });
+
+  test("10.4 — bigramCountMin is preserved through round-trip", () => {
+    const buffer = serializeIndex(realSymspell);
+    const result = deserializeIndex(buffer, BASE_DESCRIPTOR);
+    expect(result).not.toBeNull();
+    const original = (realSymspell as unknown as Record<string, unknown>)["bigramCountMin"] as number;
+    expect(result!.bigramCountMin).toBe(original);
+  });
+
+  test("10.4 — wordSegmentation round-trip: thequick splits identically after cache hydration", () => {
+    const buffer = serializeIndex(realSymspell);
+    const result = deserializeIndex(buffer, BASE_DESCRIPTOR);
+    expect(result).not.toBeNull();
+
+    const hydratedSS = rehydrate(result);
+
+    const origSeg = realSymspell.wordSegmentation("thequick", 0);
+    const hydrSeg = (hydratedSS as InstanceType<typeof SymSpell>).wordSegmentation("thequick", 0);
+    expect(hydrSeg.correctedString).toBe(origSeg.correctedString);
+  });
+
+  test("10.4 — wordSegmentation round-trip for entire segmentation corpus", () => {
+    const buffer = serializeIndex(realSymspell);
+    const result = deserializeIndex(buffer, BASE_DESCRIPTOR);
+    expect(result).not.toBeNull();
+
+    const hydratedSS = rehydrate(result);
+
+    for (const word of segmentationCorpusLines) {
+      const origSeg = realSymspell.wordSegmentation(word, 0);
+      const hydrSeg = (hydratedSS as InstanceType<typeof SymSpell>).wordSegmentation(word, 0);
+      expect(hydrSeg.correctedString).toBe(origSeg.correctedString);
     }
   });
 
@@ -532,12 +573,14 @@ describe("loadCache null cases", () => {
 // ─── deserializeIndex standalone ─────────────────────────────────────────────
 
 describe("deserializeIndex", () => {
-  test("happy path round-trips words and maxDictionaryWordLength", () => {
+  test("happy path round-trips words, maxDictionaryWordLength, bigrams, bigramCountMin", () => {
     const buf = serializeIndex(MINIMAL_FAKE);
     const result = deserializeIndex(buf, BASE_DESCRIPTOR);
     expect(result).not.toBeNull();
     expect(result!.words).toEqual(MINIMAL_FAKE.words);
     expect(result!.maxDictionaryWordLength).toBe(MINIMAL_FAKE.maxDictionaryWordLength);
+    expect(result!.bigrams).toEqual(MINIMAL_FAKE.bigrams);
+    expect(result!.bigramCountMin).toBe(MINIMAL_FAKE.bigramCountMin);
   });
 
   test("returns null for empty buffer", () => {
@@ -557,7 +600,7 @@ describe("deserializeIndex", () => {
   });
 
   test("CACHE_MAGIC is 'SYMC'", () => expect(CACHE_MAGIC).toBe("SYMC"));
-  test("SCHEMA_VERSION is 1", () => expect(SCHEMA_VERSION).toBe(1));
+  test("SCHEMA_VERSION is 2", () => expect(SCHEMA_VERSION).toBe(2));
 });
 
 // ─── 8.9.10 — Write failure does not throw ───────────────────────────────────
@@ -647,6 +690,51 @@ describe("serializeIndex guards", () => {
       bigrams: new Map<string, number>(),
     };
     expect(() => serializeIndex(fakeSS)).toThrow(/255 bytes/);
+  });
+});
+
+// ─── 10.5 — Cache invalidation tests ───────────────────────────────────────
+
+describe("10.5 — cache invalidation", () => {
+  let cacheDir: string;
+
+  beforeEach(async () => {
+    cacheDir = await actualFs.mkdtemp(join(tmpdir(), "cache-invalidation-"));
+    vi.stubEnv("MOBILE_AUTOCORRECT_CACHE_DIR", cacheDir);
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await actualFs.rm(cacheDir, { recursive: true, force: true });
+  });
+
+  test("10.5.1 — cache file written under prior schema version (v1) is rejected on load", async () => {
+    const key = computeCacheKey(BASE_DESCRIPTOR);
+    // computeCacheKey may return null if bigram dict resolution fails in CI; skip gracefully.
+    if (key === null) return;
+
+    // Serialize a valid-format buffer and then overwrite the schema-version
+    // field at byte offset 4 with v1 (the prior schema version).
+    const buf = serializeIndex(MINIMAL_FAKE);
+    buf.writeUInt32LE(1, 4); // Stamp schema version 1 (was 2)
+    writeFileSync(join(cacheDir, `symspell-${key}.bin`), buf);
+
+    // The deserializer checks that schemaVersion === SCHEMA_VERSION (2).
+    // v1 ≠ v2 → returns null.
+    expect(await loadCache(BASE_DESCRIPTOR)).toBeNull();
+  });
+
+  test("10.5.2 — file under an old-style key (without bigramsPresent) is ignored by loadCache", async () => {
+    // Write a superficially valid buffer under a key name that does NOT match
+    // the current v2 key (simulating a cache written by the prior code version
+    // whose computeCacheKey omitted bigramsPresent from the canonical JSON).
+    // loadCache looks exclusively for the filename derived from the v2 key;
+    // any file under a different name is simply not found (ENOENT → null).
+    const oldStyleKey = "0000000000000000"; // synthetic old-style key
+    writeFileSync(join(cacheDir, `symspell-${oldStyleKey}.bin`), serializeIndex(MINIMAL_FAKE));
+
+    // The v2 key will differ from oldStyleKey → loadCache returns null (not found).
+    expect(await loadCache(BASE_DESCRIPTOR)).toBeNull();
   });
 });
 

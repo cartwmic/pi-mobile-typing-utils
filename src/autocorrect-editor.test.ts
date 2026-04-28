@@ -171,7 +171,7 @@ vi.mock("@mariozechner/pi-tui", () => ({
   matchesKey: fakeMatchesKey,
 }));
 
-const { AutocorrectEditor } = await import("./autocorrect-editor.js");
+const { AutocorrectEditor, extractCorrectionContext } = await import("./autocorrect-editor.js");
 
 describe("AutocorrectEditor", () => {
   beforeEach(() => {
@@ -189,7 +189,7 @@ describe("AutocorrectEditor", () => {
     typeText(editor, "teh ");
 
     expect(editor.getText()).toBe("the ");
-    expect(engine.shouldCorrect).toHaveBeenCalledWith("teh");
+    expect(engine.shouldCorrect).toHaveBeenCalledWith("teh", expect.objectContaining({ lineText: "teh " }));
     expect(learnedDictionary.recordRejection).not.toHaveBeenCalled();
     expect(uiAdapter.setStatus).toHaveBeenCalledWith("typos-correction", "✓ teh → the");
 
@@ -406,7 +406,7 @@ function createEditor(
   const engine = {
     shouldCorrect: vi.fn((word: string) => {
       const suggestion = corrections[word];
-      return suggestion ? { corrected: true as const, suggestion } : { corrected: false as const };
+      return suggestion ? { corrected: true as const, kind: "lookup" as const, suggestion } : { corrected: false as const };
     }),
   };
 
@@ -436,3 +436,212 @@ function typeText(editor: { handleInput(data: string): void }, text: string): vo
     editor.handleInput(char);
   }
 }
+
+describe("extractCorrectionContext", () => {
+  const fakeCursor = { line: 0, col: 0 };
+
+  test("empty line returns prev and prevPrev both undefined", () => {
+    const ctx = extractCorrectionContext("", 0, fakeCursor);
+    expect(ctx.prev).toBeUndefined();
+    expect(ctx.prevPrev).toBeUndefined();
+  });
+
+  test("tokenStartCol === 0 returns prev and prevPrev both undefined", () => {
+    const ctx = extractCorrectionContext("hello teh", 0, fakeCursor);
+    expect(ctx.prev).toBeUndefined();
+    expect(ctx.prevPrev).toBeUndefined();
+  });
+
+  test("single token left of tokenStart: prev defined, prevPrev undefined", () => {
+    // lineText: "hello teh", tokenStartCol = 6 (start of 'teh')
+    const ctx = extractCorrectionContext("hello teh", 6, fakeCursor);
+    expect(ctx.prev).toBe("hello");
+    expect(ctx.prevPrev).toBeUndefined();
+  });
+
+  test("two tokens to the left: prev and prevPrev both defined", () => {
+    // lineText: "i want teh", tokenStartCol = 7 (start of 'teh')
+    const ctx = extractCorrectionContext("i want teh", 7, fakeCursor);
+    expect(ctx.prev).toBe("want");
+    expect(ctx.prevPrev).toBeUndefined(); // 'i' is single-letter, ineligible
+  });
+
+  test("two eligible tokens: want + hello", () => {
+    // lineText: "hello want teh", tokenStartCol = 11
+    const ctx = extractCorrectionContext("hello want teh", 11, fakeCursor);
+    expect(ctx.prev).toBe("want");
+    expect(ctx.prevPrev).toBe("hello");
+  });
+
+  test("mixed-case tokens are lowercased", () => {
+    // lineText: "I Want teh", tokenStartCol = 7
+    const ctx = extractCorrectionContext("I Want teh", 7, fakeCursor);
+    expect(ctx.prev).toBe("want");
+    expect(ctx.prevPrev).toBeUndefined(); // 'I' is single-letter, ineligible
+  });
+
+  test("mixed-case two eligible tokens", () => {
+    // lineText: "Hello World teh", tokenStartCol = 12
+    const ctx = extractCorrectionContext("Hello World teh", 12, fakeCursor);
+    expect(ctx.prev).toBe("world");
+    expect(ctx.prevPrev).toBe("hello");
+  });
+
+  test("punctuation between tokens: hello, world", () => {
+    // lineText: "hello, world teh", tokenStartCol = 13
+    const ctx = extractCorrectionContext("hello, world teh", 13, fakeCursor);
+    expect(ctx.prev).toBe("world");
+    expect(ctx.prevPrev).toBe("hello");
+  });
+
+  test("lineText and cursor are passed through", () => {
+    const cursor = { line: 1, col: 5 };
+    const ctx = extractCorrectionContext("hello teh", 6, cursor);
+    expect(ctx.lineText).toBe("hello teh");
+    expect(ctx.cursor).toBe(cursor);
+  });
+});
+
+describe("AutocorrectEditor — segmentation", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  test("segmentation result triggers (split) status flash", () => {
+    const engine = {
+      shouldCorrect: vi.fn(() => ({
+        corrected: true as const,
+        kind: "segmentation" as const,
+        suggestion: "the quick",
+        segments: ["the", "quick"],
+      })),
+    };
+    const learnedDictionary = { recordRejection: vi.fn(() => ({ learned: false, word: "thequick" })) };
+    const uiAdapter = { setStatus: vi.fn(), notify: vi.fn() };
+
+    const editor = new AutocorrectEditor({} as never, {} as never, {} as never, {
+      correctionEngine: engine as never,
+      learnedDictionary: learnedDictionary as never,
+      uiAdapter,
+    }) as InstanceType<typeof AutocorrectEditor> & FakeCustomEditor;
+
+    typeText(editor, "thequick ");
+
+    expect(uiAdapter.setStatus).toHaveBeenCalledWith(
+      "typos-correction",
+      "✓ thequick → the quick (split)",
+    );
+  });
+
+  test("backspace-undo after segmentation restores original concatenated token", () => {
+    // corrected = "the quick" (9 chars), trigger = " " (1 char)
+    // eat count = 9 + 1 = 10 backspaces; reinsert "thequick" (8 chars)
+    const engine = {
+      shouldCorrect: vi.fn(() => ({
+        corrected: true as const,
+        kind: "segmentation" as const,
+        suggestion: "the quick",
+        segments: ["the", "quick"],
+      })),
+    };
+    const learnedDictionary = { recordRejection: vi.fn(() => ({ learned: false, word: "thequick" })) };
+    const uiAdapter = { setStatus: vi.fn(), notify: vi.fn() };
+
+    const editor = new AutocorrectEditor({} as never, {} as never, {} as never, {
+      correctionEngine: engine as never,
+      learnedDictionary: learnedDictionary as never,
+      uiAdapter,
+    }) as InstanceType<typeof AutocorrectEditor> & FakeCustomEditor;
+
+    typeText(editor, "thequick ");
+    expect(editor.getText()).toBe("the quick ");
+
+    editor.handleInput("\x7f");
+
+    expect(editor.getText()).toBe("thequick");
+  });
+});
+
+describe("AutocorrectEditor — telemetry", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  test("emits correction.rejected on backspace-undo with correct kind and positive msUntilUndo", () => {
+    const emittedEvents: unknown[] = [];
+    const mockTelemetry = { emit: vi.fn((event: unknown) => { emittedEvents.push(event); }) };
+
+    const engine = {
+      shouldCorrect: vi.fn(() => ({
+        corrected: true as const,
+        kind: "lookup" as const,
+        suggestion: "the",
+      })),
+    };
+    const learnedDictionary = { recordRejection: vi.fn(() => ({ learned: false, word: "teh" })) };
+    const uiAdapter = { setStatus: vi.fn(), notify: vi.fn() };
+
+    const editor = new AutocorrectEditor({} as never, {} as never, {} as never, {
+      correctionEngine: engine as never,
+      learnedDictionary: learnedDictionary as never,
+      uiAdapter,
+      telemetry: mockTelemetry as never,
+    }) as InstanceType<typeof AutocorrectEditor> & FakeCustomEditor;
+
+    typeText(editor, "teh ");
+
+    // Advance time slightly so msUntilUndo > 0
+    vi.advanceTimersByTime(10);
+
+    editor.handleInput("\x7f");
+
+    const rejectedEvents = emittedEvents.filter(
+      (e): e is { event: string; kind: string; msUntilUndo: number } =>
+        typeof e === "object" && e !== null && (e as Record<string, unknown>)["event"] === "correction.rejected",
+    );
+
+    expect(rejectedEvents).toHaveLength(1);
+    expect(rejectedEvents[0]!.kind).toBe("lookup");
+    expect(rejectedEvents[0]!.msUntilUndo).toBeGreaterThan(0);
+  });
+
+  test("does not emit correction.applied", () => {
+    const emittedEvents: unknown[] = [];
+    const mockTelemetry = { emit: vi.fn((event: unknown) => { emittedEvents.push(event); }) };
+
+    const engine = {
+      shouldCorrect: vi.fn(() => ({
+        corrected: true as const,
+        kind: "lookup" as const,
+        suggestion: "the",
+      })),
+    };
+    const learnedDictionary = { recordRejection: vi.fn(() => ({ learned: false, word: "teh" })) };
+    const uiAdapter = { setStatus: vi.fn(), notify: vi.fn() };
+
+    const editor = new AutocorrectEditor({} as never, {} as never, {} as never, {
+      correctionEngine: engine as never,
+      learnedDictionary: learnedDictionary as never,
+      uiAdapter,
+      telemetry: mockTelemetry as never,
+    }) as InstanceType<typeof AutocorrectEditor> & FakeCustomEditor;
+
+    typeText(editor, "teh ");
+
+    const appliedEvents = emittedEvents.filter(
+      (e) => typeof e === "object" && e !== null && (e as Record<string, unknown>)["event"] === "correction.applied",
+    );
+
+    expect(appliedEvents).toHaveLength(0);
+  });
+});

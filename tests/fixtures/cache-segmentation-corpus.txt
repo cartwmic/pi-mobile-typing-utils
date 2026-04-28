@@ -1,0 +1,7 @@
+thequick
+wantto
+helloworld
+kubernetespod
+dockerimage
+andro
+imho

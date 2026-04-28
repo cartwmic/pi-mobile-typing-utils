@@ -1,8 +1,9 @@
 import { CustomEditor } from "@mariozechner/pi-coding-agent";
 import { matchesKey, type EditorOptions, type EditorTheme, type TUI } from "@mariozechner/pi-tui";
 
-import type { CorrectionEngine } from "./correction-engine.js";
+import type { CorrectionContext, CorrectionEngine } from "./correction-engine.js";
 import type { LearnedDictionary } from "./learned-dictionary.js";
+import type { TelemetryWriter } from "./telemetry.js";
 
 export type UIAdapter = {
   setStatus(key: string, value?: string): void;
@@ -13,6 +14,7 @@ export type AutocorrectEditorOptions = EditorOptions & {
   correctionEngine: CorrectionEngine;
   learnedDictionary: LearnedDictionary;
   uiAdapter: UIAdapter;
+  telemetry?: TelemetryWriter;
 };
 
 type CorrectionState = {
@@ -22,6 +24,8 @@ type CorrectionState = {
   wordStartCol: number;
   trailingChar: string;
   committed: boolean;
+  kind: "lookup" | "segmentation";
+  appliedAt: number;
 };
 
 const TRIGGER_CHARS = new Set([" ", ".", ",", ";", ":", "!", "?"]);
@@ -51,16 +55,18 @@ export class AutocorrectEditor extends CustomEditor {
   private readonly correctionEngine: CorrectionEngine;
   private readonly learnedDictionary: LearnedDictionary;
   private readonly uiAdapter: UIAdapter;
+  private readonly telemetry: TelemetryWriter | undefined;
   private lastCorrection: CorrectionState | undefined;
   private recentlyRejected: Map<string, string> = new Map();
   private statusClearTimer?: NodeJS.Timeout;
 
   constructor(tui: TUI, theme: EditorTheme, keybindings: object, options: AutocorrectEditorOptions) {
-    const { correctionEngine, learnedDictionary, uiAdapter, ...editorOptions } = options;
+    const { correctionEngine, learnedDictionary, uiAdapter, telemetry, ...editorOptions } = options;
     super(tui, theme, keybindings as never, editorOptions);
     this.correctionEngine = correctionEngine;
     this.learnedDictionary = learnedDictionary;
     this.uiAdapter = uiAdapter;
+    this.telemetry = telemetry;
   }
 
   override handleInput(data: string): void {
@@ -150,6 +156,16 @@ export class AutocorrectEditor extends CustomEditor {
 
     this.insertTextAtCursor(correction.original);
 
+    this.telemetry?.emit({
+      event: "correction.rejected",
+      timestamp: new Date().toISOString(),
+      msUntilUndo: Date.now() - correction.appliedAt,
+      kind: correction.kind,
+      tokenLength: correction.original.length,
+      token: null,
+      suggestion: null,
+    });
+
     const rejection = this.learnedDictionary.recordRejection(correction.original);
     if (rejection.learned) {
       this.uiAdapter.notify(`Learned: ${rejection.word}`, "info");
@@ -199,7 +215,8 @@ export class AutocorrectEditor extends CustomEditor {
       return;
     }
 
-    const result = this.correctionEngine.shouldCorrect(token);
+    const ctx = extractCorrectionContext(lineText, wordStartCol, cursor);
+    const result = this.correctionEngine.shouldCorrect(token, ctx);
     if (!result.corrected) {
       return;
     }
@@ -216,9 +233,11 @@ export class AutocorrectEditor extends CustomEditor {
       wordStartCol,
       trailingChar: trigger,
       committed: false,
+      kind: result.kind,
+      appliedAt: Date.now(),
     };
 
-    this.showCorrectionStatus(token, result.suggestion);
+    this.showCorrectionStatus(token, result.suggestion, result.kind);
   }
 
   private shouldSuppressRejectedWord(line: number, wordStartCol: number, token: string): boolean {
@@ -262,12 +281,13 @@ export class AutocorrectEditor extends CustomEditor {
     }
   }
 
-  private showCorrectionStatus(original: string, suggestion: string): void {
+  private showCorrectionStatus(original: string, suggestion: string, kind: "lookup" | "segmentation"): void {
     if (this.statusClearTimer) {
       clearTimeout(this.statusClearTimer);
     }
 
-    this.uiAdapter.setStatus(STATUS_KEY, `✓ ${original} → ${suggestion}`);
+    const kindSuffix = kind === "segmentation" ? " (split)" : "";
+    this.uiAdapter.setStatus(STATUS_KEY, `✓ ${original} → ${suggestion}${kindSuffix}`);
     this.statusClearTimer = setTimeout(() => {
       this.statusClearTimer = undefined;
       this.uiAdapter.setStatus(STATUS_KEY, undefined);
@@ -336,6 +356,60 @@ export class AutocorrectEditor extends CustomEditor {
 
 function makeRejectedKey(line: number, wordStartCol: number): string {
   return `${line}:${wordStartCol}`;
+}
+
+/**
+ * Walk left from tokenStartCol, skipping SAFE_BOUNDARY_CHARS, to extract up
+ * to two preceding eligible tokens for correction context.
+ */
+export function extractCorrectionContext(
+  lineText: string,
+  tokenStartCol: number,
+  cursor: { line: number; col: number },
+): CorrectionContext {
+  let prev: string | undefined;
+  let prevPrev: string | undefined;
+
+  let col = tokenStartCol - 1;
+
+  // Find up to two eligible tokens walking left
+  while (col >= 0) {
+    // Skip boundary characters
+    while (col >= 0 && SAFE_BOUNDARY_CHARS.has(lineText[col]!)) {
+      col -= 1;
+    }
+
+    if (col < 0) break;
+
+    // We have a non-boundary character — check if it's alphabetic
+    if (!isAsciiLetter(lineText[col])) {
+      // Non-alphabetic, non-boundary (e.g. digit): stop walking
+      break;
+    }
+
+    // Capture the contiguous alphabetic run
+    const runEnd = col;
+    while (col >= 0 && isAsciiLetter(lineText[col])) {
+      col -= 1;
+    }
+    const runStart = col + 1;
+    const run = lineText.slice(runStart, runEnd + 1);
+
+    // Check eligibility (must match ELIGIBLE_TOKEN: /^[A-Za-z]{2,}$/)
+    if (!ELIGIBLE_TOKEN.test(run)) {
+      // Single-letter or otherwise ineligible — skip past it, keep walking
+      continue;
+    }
+
+    if (prev === undefined) {
+      prev = run.toLowerCase();
+    } else {
+      prevPrev = run.toLowerCase();
+      break;
+    }
+  }
+
+  return { prev, prevPrev, lineText, cursor };
 }
 
 function isAsciiLetter(char: string | undefined): boolean {

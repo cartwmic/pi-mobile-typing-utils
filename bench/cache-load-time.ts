@@ -8,11 +8,27 @@
  * Run: npx tsx bench/cache-load-time.ts
  */
 
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+
+/**
+ * Poll the cache directory for the final symspell-*.bin file. The cache
+ * write is fire-and-forget; without this poll Pass 2 sees only a *.tmp file
+ * (or nothing) and misses the cache.
+ */
+async function waitForCacheWrite(cacheDir: string, timeoutMs = 30_000): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const files = await readdir(cacheDir);
+      if (files.some((f) => /^symspell-[0-9a-f]{16}\.bin$/.test(f))) return;
+    } catch {}
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
 
 const TECH_DICT_PATH = fileURLToPath(
   new URL("../data/tech-dictionary.txt", import.meta.url),
@@ -47,6 +63,9 @@ async function main() {
     // Pass 1: cache miss (fresh build + cache write).
     const freshMs = await buildEngine(tempDir);
     console.log(`Fresh build (cache miss):  ${Math.round(freshMs)} ms`);
+
+    // Cache write is fire-and-forget; wait for the rename to land before Pass 2.
+    await waitForCacheWrite(tempDir);
 
     // Pass 2: cache hit (load from disk).
     const hitMs = await buildEngine(tempDir);

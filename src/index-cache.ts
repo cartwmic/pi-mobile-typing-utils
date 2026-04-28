@@ -1,22 +1,24 @@
 /**
  * index-cache.ts — Persistent on-disk cache for the SymSpell deletion index.
  *
- * Binary format (schema v1):
+ * Binary format (schema v2):
  *   Header:       4 bytes magic "SYMC" | u32 schema | u32 maxEditDistance | u32 maxDictWordLen
  *   String table: u32 count | (u8 len + utf-8 bytes) * count
  *   Words:        u32 count | (u32 strIdx + f64 freq) * count
  *   Deletes:      u32 count | (i32 hash + u16 bucketLen + u32 strIdx * bucketLen) * count
+ *   Bigrams:      f64 bigramCountMin | u32 count | (u32 w1Idx + u32 w2Idx + f64 count) * count
  *
  * The `symspell` parameter throughout uses `any` to avoid coupling this module
  * to the upstream SymSpell type — callers pass a real SymSpell instance that
  * structurally satisfies the field accesses below. The serializer reaches into
  * nominally-private fields (words, deletes, maxDictionaryWordLength,
- * maxDictionaryEditDistance, belowThresholdWords) whose names are pinned to
- * symspell-ts v0.0.2 and verified in node_modules/symspell-ts/dist/symspell.js.
+ * maxDictionaryEditDistance, belowThresholdWords, bigrams, bigramCountMin)
+ * whose names are pinned to symspell-ts v0.0.2 and verified in
+ * node_modules/symspell-ts/dist/symspell.js.
  */
 
 import { createHash, randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -35,11 +37,13 @@ export interface HydrationResult {
   words: Map<string, number>;
   deletes: Map<number, string[]>;
   maxDictionaryWordLength: number;
+  bigrams: Map<string, number>;
+  bigramCountMin: number;
 }
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 export const CACHE_MAGIC = "SYMC";
 export const FILENAME_PATTERN = /^symspell-[0-9a-f]{16}\.bin$/;
 
@@ -69,12 +73,64 @@ let cacheDisabled = false;
 let dirEnsured = false;
 
 /**
+ * Module-level bigram dictionary hash cache.
+ *
+ * Pre-computed lazily on the first call to getBigramDictHash() and cached
+ * for the lifetime of the module, so computeCacheKey() stays synchronous.
+ * undefined = not yet computed; null = resolution failed (fail-closed).
+ *
+ * Design rationale: making computeCacheKey() async would require updating all
+ * callers (loadCache, writeCache, the engine, test call sites). Instead, we
+ * pre-compute the hash synchronously via readdirSync + readFileSync (the same
+ * pattern computeCacheKey already uses for package.json). The result is cached
+ * to avoid reading the 4.9 MB bigram file on every cache-key computation.
+ */
+let bigramDictHashCache: string | null | undefined = undefined;
+
+/**
+ * Lazily resolve and hash the symspell-ts bigram dictionary file.
+ * Uses synchronous I/O (readdirSync, readFileSync) for the same reason
+ * computeCacheKey uses readFileSync for package.json.
+ * Returns null if the glob finds 0 or 2+ matches, or if any I/O fails.
+ */
+function getBigramDictHash(): string | null {
+  if (bigramDictHashCache !== undefined) return bigramDictHashCache;
+  try {
+    const pkgRoot = resolveSymspellPackageRoot();
+    if (pkgRoot === null) {
+      bigramDictHashCache = null;
+      return null;
+    }
+    const dataDir = join(pkgRoot, "data");
+    const files = readdirSync(dataDir);
+    const matches = files.filter((f) => /^frequency_bigramdictionary_en_.*\.txt$/.test(f));
+    if (matches.length !== 1) {
+      console.info(
+        `[mobile-autocorrect] cache disabled: expected exactly 1 bigram dict file, found ${matches.length}`,
+      );
+      bigramDictHashCache = null;
+      return null;
+    }
+    const bytes = readFileSync(join(dataDir, matches[0]));
+    bigramDictHashCache = createHash("sha256").update(bytes).digest("hex").slice(0, 16);
+    return bigramDictHashCache;
+  } catch (err) {
+    console.info(
+      `[mobile-autocorrect] cache disabled: cannot hash bigram dict: ${formatError(err)}`,
+    );
+    bigramDictHashCache = null;
+    return null;
+  }
+}
+
+/**
  * Reset module-level cache state. FOR TESTS ONLY — production code must not
  * call this. Allows tests to re-exercise the mkdir path without module reload.
  */
 export function __resetCacheDisabledForTests(): void {
   cacheDisabled = false;
   dirEnsured = false;
+  bigramDictHashCache = undefined;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -148,6 +204,17 @@ export function computeCacheKey(descriptor: CacheDescriptor): string | null {
     return null;
   }
 
+  // Resolve the bigram dict hash (lazy, cached at module level so this
+  // function stays synchronous). Fail-closed: if the bigram dict cannot be
+  // found or hashed, the cache is disabled for this process.
+  const bigramDictHash = getBigramDictHash();
+  if (bigramDictHash === null) {
+    console.info(
+      "[mobile-autocorrect] cache disabled: bigram dictionary file not resolvable",
+    );
+    return null;
+  }
+
   const canonical = JSON.stringify({
     maxED: descriptor.maxEditDistance,
     prefixLen: descriptor.prefixLength,
@@ -155,6 +222,8 @@ export function computeCacheKey(descriptor: CacheDescriptor): string | null {
     countThreshold: descriptor.countThreshold,
     libVersion: version,
     schemaVersion: SCHEMA_VERSION,
+    bigramsPresent: true,
+    bigramDictHash,
   });
 
   return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
@@ -175,7 +244,7 @@ export function getCacheFilePath(key: string): string | null {
 // ─── Serializer ──────────────────────────────────────────────────────────────
 
 /**
- * Serialize a SymSpell instance to a binary buffer (schema v1).
+ * Serialize a SymSpell instance to a binary buffer (schema v2).
  *
  * MAY throw:
  *  - BucketOverflowError  — any delete bucket has > 65535 entries (u16 max)
@@ -195,14 +264,16 @@ export function serializeIndex(symspell: any): Buffer {
     | Map<string, number>
     | undefined
     | null;
+  const bigrams = (symspell.bigrams ?? new Map()) as Map<string, number>;
+  const bigramCountMin = (symspell.bigramCountMin ?? Number.MAX_SAFE_INTEGER) as number;
 
-  // Assertion (b): schema v1 does not serialize belowThresholdWords.
+  // Assertion (b): schema v2 does not serialize belowThresholdWords.
   // With countThreshold=1 and a standard English unigram load this is always
   // empty. If it isn't, something changed that the format can't represent.
   if (belowThresholdWords && belowThresholdWords.size > 0) {
     throw new Error(
       `[index-cache] BELOW_THRESHOLD_NONEMPTY: belowThresholdWords has ` +
-        `${belowThresholdWords.size} entries. Schema v1 does not serialize this map. ` +
+        `${belowThresholdWords.size} entries. Schema v2 does not serialize this map. ` +
         `Bump the schema version if countThreshold > 1 is needed.`,
     );
   }
@@ -214,8 +285,19 @@ export function serializeIndex(symspell: any): Buffer {
     }
   }
 
+  // Pre-process bigrams: parse "w1 w2" keys and keep only well-formed entries
+  // (exactly one space separator). This ensures the size calculation matches
+  // the bytes written.
+  const bigramEntries: [string, string, number][] = [];
+  for (const [key, count] of bigrams.entries()) {
+    const spaceIdx = key.indexOf(" ");
+    if (spaceIdx === -1 || spaceIdx !== key.lastIndexOf(" ")) continue;
+    bigramEntries.push([key.slice(0, spaceIdx), key.slice(spaceIdx + 1), count]);
+  }
+
   // Build deduplicated string table in insertion order: first all word keys,
-  // then any new strings found in delete bucket suggestion lists.
+  // then any new strings found in delete bucket suggestion lists, then any
+  // new strings referenced by bigram entries.
   const stringTable = new Map<string, number>(); // string → index
 
   function intern(s: string): number {
@@ -230,6 +312,10 @@ export function serializeIndex(symspell: any): Buffer {
   for (const word of words.keys()) intern(word);
   for (const suggestions of deletes.values()) {
     for (const s of suggestions) intern(s);
+  }
+  for (const [w1, w2] of bigramEntries) {
+    intern(w1);
+    intern(w2);
   }
 
   // Pre-encode strings and validate the u8 length prefix constraint.
@@ -264,7 +350,10 @@ export function serializeIndex(symspell: any): Buffer {
     deletesSize += 4 + 2 + 4 * suggestions.length;
   }
 
-  const totalSize = headerSize + stringTableSize + wordsSize + deletesSize;
+  // Bigrams: 8 (bigramCountMin f64) + 4 (count u32) + 16 per entry (u32+u32+f64)
+  const bigramsSize = 8 + 4 + bigramEntries.length * 16;
+
+  const totalSize = headerSize + stringTableSize + wordsSize + deletesSize + bigramsSize;
   const buf = Buffer.allocUnsafe(totalSize);
   let cursor = 0;
 
@@ -310,6 +399,22 @@ export function serializeIndex(symspell: any): Buffer {
       buf.writeUInt32LE(stringTable.get(s)!, cursor);
       cursor += 4;
     }
+  }
+
+  // ── Write bigrams section ────────────────────────────────────────────────
+  // bigramCountMin is written FIRST (before count) so it is restored before
+  // iterating bigram entries, matching SymSpell’s internal load-order invariant.
+  buf.writeDoubleLE(bigramCountMin, cursor);
+  cursor += 8;
+  buf.writeUInt32LE(bigramEntries.length, cursor);
+  cursor += 4;
+  for (const [w1, w2, bigramCount] of bigramEntries) {
+    buf.writeUInt32LE(stringTable.get(w1)!, cursor);
+    cursor += 4;
+    buf.writeUInt32LE(stringTable.get(w2)!, cursor);
+    cursor += 4;
+    buf.writeDoubleLE(bigramCount, cursor);
+    cursor += 8;
   }
 
   if (cursor !== totalSize) {
@@ -441,7 +546,26 @@ export function deserializeIndex(
       deletes.set(hash, suggestions);
     }
 
-    return { words, deletes, maxDictionaryWordLength };
+    // ── Bigrams section ────────────────────────────────────────────────
+    // bigramCountMin is read FIRST (serialized before the entry list).
+    const bigramCountMin = readF64();
+    if (bigramCountMin === null) return null;
+
+    const bigramCount = readU32();
+    if (bigramCount === null) return null;
+
+    const bigrams = new Map<string, number>();
+    for (let i = 0; i < bigramCount; i++) {
+      const w1Idx = readU32();
+      if (w1Idx === null || w1Idx >= strings.length) return null;
+      const w2Idx = readU32();
+      if (w2Idx === null || w2Idx >= strings.length) return null;
+      const count = readF64();
+      if (count === null) return null;
+      bigrams.set(`${strings[w1Idx]} ${strings[w2Idx]}`, count);
+    }
+
+    return { words, deletes, maxDictionaryWordLength, bigrams, bigramCountMin };
   } catch {
     // Any unexpected exception (e.g., buffer.readXxx out of bounds) → corrupt.
     return null;

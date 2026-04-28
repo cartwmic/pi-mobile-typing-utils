@@ -135,3 +135,144 @@ ls -lh ~/.pi/agent/cache/mobile-autocorrect/
 - If any step fails, check console output for `[mobile-autocorrect]` log lines.
 - Reset with `rm -rf ~/.pi/agent/cache/mobile-autocorrect/` to return to cold-start state.
 - The Termux cache-miss build blocks keystroke processing during the synchronous deletion-table build. This is expected behavior for cache-miss paths; the cache makes cache-hit the steady-state.
+
+---
+
+## Phase 12 additions (context rerank, segmentation, telemetry) — Termux
+
+This section mirrors `macos-smoke-test.md §Phase 12` with Termux-specific timing
+adjustments. Run after the Phase 12 build has passed all 442 automated tests.
+
+### Termux-specific notes
+
+- **Cold-start time is 2–3× the macOS time** for the same operation.
+- **Cache-hit startup soft target on Termux:** ≤ 2 s (vs ≤ 500 ms on macOS).
+- **Memory soft target on Termux:** rss delta ≤ 100 MB (vs ≤ 150 MB on macOS).
+- **Default telemetry cache dir on Termux:** `/data/data/com.termux/files/home/.pi/agent/cache/mobile-autocorrect/` unless overridden by `MOBILE_AUTOCORRECT_CACHE_DIR`.
+
+---
+
+### Phase 12 Step 1 — Cold-start build time with bigrams loaded (TIME THIS)
+
+Bigrams are now loaded eagerly (schema v2 cache). Cold-start build time on Termux
+is higher than the previous unigram-only baseline.
+
+1. Clear cache:
+   ```bash
+   rm -rf ~/.pi/agent/cache/mobile-autocorrect/
+   ```
+2. Start Pi: `pi -e ./dist/index.js`, run `/typos on`, start stopwatch.
+3. Stop when footer shows `✓ Autocorrect`. Record time below.
+
+**Expected Termux timing:** approximately 3–6 s for a cold build at ED=2 with bigrams
+(2–3× the macOS ~1.5–3 s range). Cache-hit startup should be ≤ 2 s (Termux soft
+target; the v2 `.bin` file is slightly larger than v1 due to bigram serialization).
+
+The resident-memory cost of loading bigrams is approximately +24 MB over the previous
+unigram-only baseline. Total rss delta is expected to be ≤ 100 MB on Termux.
+
+---
+
+### Phase 12 Step 2 — Word segmentation: accepted case
+
+Same as macOS Step 2. Latency of the segmentation call is expected to be ~5–30×
+higher on Termux than on macOS.
+
+1. With `/typos on`, type `thequick` followed by a space.
+2. **Observe:** Pane shows `the quick ` (split).
+3. **Observe:** Status flash `Corrected: thequick → the quick (split)`.
+
+**Expected:** Same outcome as macOS. Note that segmentation latency on Termux may
+be noticeable for very long tokens at ED=1.
+
+---
+
+### Phase 12 Step 3 — Word segmentation: rejected case (tech-prose concatenation)
+
+1. Type `kubernetespod` followed by a space.
+2. **Observe:** Pane shows `kubernetespod ` UNCHANGED.
+
+**Expected:** Same as macOS (v1 known limitation; `kubernetes` not in SymSpell unigram index).
+
+---
+
+### Phase 12 Step 4 — Context rerank: disambiguation
+
+1. Type `i want te` followed by a space.
+2. **Observe:** Pane shows `i want to ` or `i want the `.
+
+**Expected:** Same outcome as macOS. The rerank operates on the same bundled corpus
+regardless of platform.
+
+---
+
+### Phase 12 Step 5 — Telemetry file presence check
+
+1. Start Pi with an isolated cache dir:
+   ```bash
+   MOBILE_AUTOCORRECT_CACHE_DIR=/data/data/com.termux/files/tmp/smoke-telem \
+     pi -e ./dist/index.js
+   ```
+   (Adjust the path to a writable location on your device.)
+2. Run `/typos on`, type `teh `, exit Pi.
+3. Check for the telemetry file:
+   ```bash
+   ls /data/data/com.termux/files/tmp/smoke-telem/telemetry/
+   # Expected: events-YYYY-MM-DD.ndjson
+   ```
+4. Inspect content:
+   ```bash
+   cat .../telemetry/events-*.ndjson
+   ```
+
+**Expected:** Same shape as macOS. At `metrics` level:
+- `"event":"correction.applied"` line present.
+- `token` and `suggestion` fields absent.
+- `latencyMs` and structural fields present.
+
+---
+
+### Phase 12 Step 6 — /typos stats output
+
+Same as macOS Step 6. The rendering path is platform-independent.
+
+1. Fire a few corrections, run `/typos stats`.
+2. **Observe:** Notification begins with `Mobile autocorrect telemetry summary`
+   and contains `corrections applied:`.
+
+---
+
+### Phase 12 Observed timings (fill in after running)
+
+| Scenario | Device / Android version | Time |
+|----------|--------------------------|------|
+| Cold start with bigrams (Phase 12 Step 1) | | |
+| Cache-hit startup (Phase 12 Step 1, 2nd session) | | |
+| `thequick ` → `the quick ` latency (perceived) | | |
+
+---
+
+### Phase 12 Pass / Fail Criteria (Termux)
+
+| Observation | Expected result |
+|-------------|----------------|
+| Cold-start with bigrams | ≤ 6 s on Termux |
+| Cache-hit startup | ≤ 2 s on Termux |
+| `thequick ` → `the quick ` with `(split)` flash | ✓ |
+| `kubernetespod ` → UNCHANGED | ✓ |
+| `i want te ` → `i want to ` or `i want the ` | ✓ |
+| Telemetry file written after correction | ✓ |
+| `metrics`-level file omits `token`/`suggestion` | ✓ |
+| `/typos stats` renders `corrections applied:` | ✓ |
+
+---
+
+## Notes (Phase 12)
+
+- Termux telemetry default cache dir: `/data/data/com.termux/files/home/.pi/agent/cache/mobile-autocorrect/telemetry/`.
+  Override with `MOBILE_AUTOCORRECT_CACHE_DIR`.
+- Memory budget: rss delta ≤ 100 MB on Termux (vs ≤ 150 MB on macOS). Run
+  `bench/memory-residency.ts` to measure the actual delta.
+- Trigram side-table is deferred (§16.2). The bench falls back to bigram + unigram
+  scoring when `data/trigram-top500k.tsv` is absent — no user-visible error.
+- Disable telemetry: `/typos config telemetry off`.

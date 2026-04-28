@@ -1,19 +1,48 @@
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { SymSpell, Verbosity, loadDefaultDictionaries } from "symspell-ts";
 import {
   CACHE_COMPACT_LEVEL,
   CACHE_COUNT_THRESHOLD,
   CACHE_PREFIX_LENGTH,
   computeCacheKey,
+  getCacheDir,
   loadCache,
   pruneStaleSiblings,
   writeCache,
   type CacheDescriptor,
 } from "./index-cache.js";
-import { resolveSymspellPackageRoot as defaultResolveSymspellPackageRoot } from "./symspell-paths.js";
+import { NgramRerankModule } from "./ngram-rerank.js";
+import type { TelemetryWriter } from "./telemetry.js";
+import { getTrigramTableSingleton } from "./trigram-table.js";
+import type { TrigramTable } from "./trigram-table.js";
 
-export type CorrectionResult = { corrected: false } | { corrected: true; suggestion: string };
+// ─── Public types ─────────────────────────────────────────────────────────────
+
+/**
+ * Surrounding-word context passed to shouldCorrect(). The shape is a structural
+ * superset of the rerank module's RerankCorrectionContext, making it directly
+ * assignable without a cast or circular import.
+ */
+export type CorrectionContext = {
+  /** Previous eligible token, lowercased; undefined at line start. */
+  prev?: string;
+  /** Token before prev, lowercased; undefined when not available. */
+  prevPrev?: string;
+  /** Full current line at trigger time (debug telemetry only). */
+  lineText?: string;
+  /** Cursor position at trigger time (debug telemetry only). */
+  cursor?: { line: number; col: number };
+};
+
+export type CorrectionKind = "lookup" | "segmentation";
+
+export type CorrectionResult =
+  | { corrected: false }
+  | { corrected: true; kind: "lookup"; suggestion: string }
+  | { corrected: true; kind: "segmentation"; suggestion: string; segments: string[] };
 
 /**
  * Readiness state of the correction engine.
@@ -26,61 +55,56 @@ export type ReadinessState = "building" | "ready" | "degraded";
 export interface CorrectionEngineOptions {
   techDictPath: string;
   isLearned: (word: string) => boolean;
-  /**
-   * Maximum SymSpell edit distance for typo lookups. Baked into the
-   * SymSpell index at initialize() time — callers must rebuild the engine
-   * (drop and re-create) to change it. Defaults to 2.
-   */
   maxEditDistance?: number;
-  /**
-   * Live accessor for the minimum word length eligible for correction.
-   * Read on every shouldCorrect() call so that updates from `/typos config
-   * minWordLength <n>` take effect without rebuilding the engine. When
-   * omitted, defaults to FALLBACK_MIN_WORD_LENGTH (2).
-   */
   getMinWordLength?: () => number;
-  /**
-   * Live accessor for the floor edit distance used by the adaptive ED curve:
-   *   ED(L) = clamp(minED + floor((L - minWL) / step), minED, maxED)
-   * Read on every shouldCorrect() call — no rebuild required when changed.
-   * When omitted, defaults to FALLBACK_MIN_EDIT_DISTANCE (1).
-   */
   getMinEditDistance?: () => number;
-  /**
-   * Live accessor for the number of additional characters of word length
-   * required to ramp the effective edit distance up by one step.
-   * Read on every shouldCorrect() call — no rebuild required when changed.
-   * When omitted, defaults to FALLBACK_EDIT_DISTANCE_STEP_EVERY (4).
-   */
   getEditDistanceStepEvery?: () => number;
+  getRerankBigramWeight?: () => number;
+  getRerankTrigramWeight?: () => number;
+  getRerankEditDistancePenalty?: () => number;
+  getEnableContextRerank?: () => boolean;
+  getEnableSegmentation?: () => boolean;
+  getSegmentationMinLength?: () => number;
+  getSegmentationMaxEditDistance?: () => number;
+  getSegmentationLogProbFloor?: () => number;
+  getSegmentationVsLookupBias?: () => number;
   /**
-   * @internal Test-only injection point for the symspell package-root resolver.
-   * Pass `() => null` to force the upstream `loadDefaultDictionaries` fallback
-   * path (which loads bigrams as a side effect). Defaults to the real
-   * `resolveSymspellPackageRoot` implementation.
+   * Injected accessor returning the current owner-generation token from
+   * `commands.ts` state. Used by the orphan-generation guard in
+   * `attachIfStillOwning` to detect superseded engine instances.
+   * When omitted, defaults to `() => 0` (always current, suitable for tests).
    */
-  _resolveSymspellPackageRoot?: () => string | null;
+  getOwnerGeneration?: () => number;
+  /**
+   * Override the trigram TSV path. Test-only knob — production code resolves
+   * the TSV relative to the package data directory via `resolveProjectDataDir()`.
+   */
+  getTrigramTsvPath?: () => string;
+  telemetry?: TelemetryWriter;
 }
+
+// ─── Fallback constants ───────────────────────────────────────────────────────
 
 const FALLBACK_MAX_EDIT_DISTANCE = 2;
 const FALLBACK_MIN_WORD_LENGTH = 2;
 export const FALLBACK_MIN_EDIT_DISTANCE = 1;
 export const FALLBACK_EDIT_DISTANCE_STEP_EVERY = 4;
 
-// SymSpell constructor positional-argument constants.
-// Pinned here (rather than relying on upstream defaults) so that:
-//  (a) prefixLength > maxEditDistance is enforced even when the ceiling is 4, and
-//  (b) compactLevel and countThreshold — which affect the internal deletion-table
-//      structure that the cache subsystem serializes — are fixed in source code
-//      so an upstream default change doesn't silently corrupt future cache files.
+const FALLBACK_RERANK_BIGRAM_WEIGHT = 0.5;
+const FALLBACK_RERANK_TRIGRAM_WEIGHT = 0.3;
+const FALLBACK_RERANK_EDIT_DISTANCE_PENALTY = 1.0;
+const FALLBACK_ENABLE_CONTEXT_RERANK = true;
+
+const FALLBACK_ENABLE_SEGMENTATION = true;
+const FALLBACK_SEGMENTATION_MIN_LENGTH = 6;
+const FALLBACK_SEGMENTATION_MAX_EDIT_DISTANCE = 1;
+const FALLBACK_SEGMENTATION_LOG_PROB_FLOOR = -12.0;
+const FALLBACK_SEGMENTATION_VS_LOOKUP_BIAS = 0.0;
+
 const SYMSPELL_INITIAL_CAPACITY = 16;
-// The three constants below are imported from src/index-cache.ts (the lower-level
-// cache module that encodes them into the cache key). Importing rather than
-// duplicating ensures both modules stay in sync automatically.
-// Cross-referenced from src/index-cache.ts; if you change one, update both.
-const SYMSPELL_PREFIX_LENGTH = CACHE_PREFIX_LENGTH; // 7; must be > maxEditDistance (max 4 < 7 ✓)
-const SYMSPELL_COUNT_THRESHOLD = CACHE_COUNT_THRESHOLD; // 1
-const SYMSPELL_COMPACT_LEVEL = CACHE_COMPACT_LEVEL; // 5
+const SYMSPELL_PREFIX_LENGTH = CACHE_PREFIX_LENGTH;
+const SYMSPELL_COUNT_THRESHOLD = CACHE_COUNT_THRESHOLD;
+const SYMSPELL_COMPACT_LEVEL = CACHE_COMPACT_LEVEL;
 
 export class CorrectionEngine {
   private readonly techDictPath: string;
@@ -89,13 +113,27 @@ export class CorrectionEngine {
   private readonly getMinWordLength: () => number;
   private readonly getMinEditDistance: () => number;
   private readonly getEditDistanceStepEvery: () => number;
-  private readonly resolveSymspellPackageRoot: () => string | null;
+  private readonly getRerankBigramWeight: () => number;
+  private readonly getRerankTrigramWeight: () => number;
+  private readonly getRerankEditDistancePenalty: () => number;
+  private readonly getEnableContextRerank: () => boolean;
+  private readonly getEnableSegmentation: () => boolean;
+  private readonly getSegmentationMinLength: () => number;
+  private readonly getSegmentationMaxEditDistance: () => number;
+  private readonly getSegmentationLogProbFloor: () => number;
+  private readonly getSegmentationVsLookupBias: () => number;
+
   private symspell?: SymSpell;
   private techDict: Set<string> = new Set();
+  /** N-gram rerank module; constructed inside initialize() after SymSpell is ready. */
+  rerank?: NgramRerankModule;
+  private readonly telemetry?: TelemetryWriter;
   private readinessState: ReadinessState = "building";
   private lastInitError?: unknown;
   private cachedEligibleRegex?: { minLength: number; pattern: RegExp };
   private inFlightInit: Promise<void> | undefined;
+  private readonly getOwnerGeneration: () => number;
+  private readonly getTrigramTsvPath: (() => string) | undefined;
 
   constructor({
     techDictPath,
@@ -104,7 +142,18 @@ export class CorrectionEngine {
     getMinWordLength,
     getMinEditDistance,
     getEditDistanceStepEvery,
-    _resolveSymspellPackageRoot,
+    getRerankBigramWeight,
+    getRerankTrigramWeight,
+    getRerankEditDistancePenalty,
+    getEnableContextRerank,
+    getEnableSegmentation,
+    getSegmentationMinLength,
+    getSegmentationMaxEditDistance,
+    getSegmentationLogProbFloor,
+    getSegmentationVsLookupBias,
+    getOwnerGeneration,
+    getTrigramTsvPath,
+    telemetry,
   }: CorrectionEngineOptions) {
     this.techDictPath = techDictPath;
     this.isLearned = isLearned;
@@ -112,16 +161,24 @@ export class CorrectionEngine {
     this.getMinWordLength = getMinWordLength ?? (() => FALLBACK_MIN_WORD_LENGTH);
     this.getMinEditDistance = getMinEditDistance ?? (() => FALLBACK_MIN_EDIT_DISTANCE);
     this.getEditDistanceStepEvery = getEditDistanceStepEvery ?? (() => FALLBACK_EDIT_DISTANCE_STEP_EVERY);
-    this.resolveSymspellPackageRoot = _resolveSymspellPackageRoot ?? defaultResolveSymspellPackageRoot;
-    // readinessState is "building" from field initializer above.
+    this.getRerankBigramWeight = getRerankBigramWeight ?? (() => FALLBACK_RERANK_BIGRAM_WEIGHT);
+    this.getRerankTrigramWeight = getRerankTrigramWeight ?? (() => FALLBACK_RERANK_TRIGRAM_WEIGHT);
+    this.getRerankEditDistancePenalty = getRerankEditDistancePenalty ?? (() => FALLBACK_RERANK_EDIT_DISTANCE_PENALTY);
+    this.getEnableContextRerank = getEnableContextRerank ?? (() => FALLBACK_ENABLE_CONTEXT_RERANK);
+    this.getEnableSegmentation = getEnableSegmentation ?? (() => FALLBACK_ENABLE_SEGMENTATION);
+    this.getSegmentationMinLength = getSegmentationMinLength ?? (() => FALLBACK_SEGMENTATION_MIN_LENGTH);
+    this.getSegmentationMaxEditDistance = getSegmentationMaxEditDistance ?? (() => FALLBACK_SEGMENTATION_MAX_EDIT_DISTANCE);
+    this.getSegmentationLogProbFloor = getSegmentationLogProbFloor ?? (() => FALLBACK_SEGMENTATION_LOG_PROB_FLOOR);
+    this.getSegmentationVsLookupBias = getSegmentationVsLookupBias ?? (() => FALLBACK_SEGMENTATION_VS_LOOKUP_BIAS);
+    this.getOwnerGeneration = getOwnerGeneration ?? (() => 0);
+    this.getTrigramTsvPath = getTrigramTsvPath;
+    this.telemetry = telemetry;
   }
 
-  /** Public accessor for the current readiness state. */
   getReadinessState(): ReadinessState {
     return this.readinessState;
   }
 
-  /** Returns the error thrown during the most recent failed initialize(), if any. */
   getLastInitError(): unknown | undefined {
     return this.lastInitError;
   }
@@ -130,15 +187,13 @@ export class CorrectionEngine {
     if (this.readinessState === "ready") {
       return;
     }
-    // Idempotency under concurrent in-flight calls: if a build is already in
-    // progress, return the existing promise rather than starting a second one.
     if (this.readinessState === "building" && this.inFlightInit !== undefined) {
       return this.inFlightInit;
     }
 
     this.inFlightInit = (async () => {
+      const initStart = Date.now();
       try {
-        // Build the cache descriptor from this engine's config + pinned constants.
         const descriptor: CacheDescriptor = {
           maxEditDistance: this.maxEditDistance,
           prefixLength: SYMSPELL_PREFIX_LENGTH,
@@ -160,27 +215,18 @@ export class CorrectionEngine {
         if (key !== null) {
           const hydration = await loadCache(descriptor);
           if (hydration !== null) {
-            // Hydrate the SymSpell instance by writing directly into its
-            // nominally-private fields. The cache key embeds the symspell-ts
-            // version + cache schema version, so any upstream internal
-            // restructuring auto-invalidates existing caches.
             (symspell as any).words = hydration.words;
             (symspell as any).deletes = hydration.deletes;
             (symspell as any).maxDictionaryWordLength = hydration.maxDictionaryWordLength;
+            (symspell as any).bigrams = hydration.bigrams;
+            (symspell as any).bigramCountMin = hydration.bigramCountMin;
             cacheLoaded = true;
-            // Fire-and-forget: prune stale sibling cache files after a
-            // successful load. Failures never propagate.
             void pruneStaleSiblings(key).catch(() => undefined);
           }
         }
 
         if (!cacheLoaded) {
-          // Cache miss or caching disabled — run the unigram-only fresh build
-          // (with resolver-failure fallback to upstream loadDefaultDictionaries).
           await this.loadDictionaries(symspell);
-          // Fire-and-forget: persist the built index so the next session can
-          // load it quickly. Failures NEVER propagate — readiness is not gated
-          // on cache write success.
           if (key !== null) {
             void writeCache(descriptor, symspell).catch(() => undefined);
           }
@@ -194,18 +240,74 @@ export class CorrectionEngine {
             .filter(Boolean),
         );
 
+        // Construct NgramRerankModule AFTER symspell is assigned so
+        // the getSymspell live accessor always returns a valid instance.
+        const rerank = new NgramRerankModule({
+          getBigramWeight: () => this.getRerankBigramWeight(),
+          getTrigramWeight: () => this.getRerankTrigramWeight(),
+          getEdPenalty: () => this.getRerankEditDistancePenalty(),
+          getEnableContextRerank: () => this.getEnableContextRerank(),
+          getSymspell: () => this.symspell!,
+        });
+
         this.symspell = symspell;
         this.techDict = techDict;
+        this.rerank = rerank;
         this.readinessState = "ready";
+
+        // §12.2 — engine.init telemetry (success path)
+        this.telemetry?.emit({
+          event: "engine.init",
+          timestamp: new Date().toISOString(),
+          fromCache: cacheLoaded,
+          buildMs: Date.now() - initStart,
+          unigramCount: (symspell as any).words.size as number,
+          bigramCount: (symspell as any).bigrams.size as number,
+          outcome: "ready",
+          cause: null,
+        });
+
+        // § 8.2 — Kick off lazy trigram attach (fire-and-forget, § 8.3).
+        // ownerGen is captured NOW (before the async load) so the orphan-
+        // generation guard in attachIfStillOwning can compare against the
+        // generation that was current when this engine reached "ready".
+        {
+          const ownerGen = this.getOwnerGeneration();
+          const cacheDir = getCacheDir();
+          const tsvPath = this.getTrigramTsvPath
+            ? this.getTrigramTsvPath()
+            : resolve(this.resolveProjectDataDir(), "trigram-top500k.tsv");
+          if (cacheDir !== null) {
+            void getTrigramTableSingleton({
+              cacheDir,
+              tsvPath,
+              telemetry: this.telemetry,
+            })
+              .then((table) => this.attachIfStillOwning(table, ownerGen))
+              .catch(() => undefined); // defensive top-level swallow (§ 8.3)
+          }
+        }
       } catch (error) {
         this.symspell = undefined;
         this.techDict = new Set();
+        this.rerank = undefined;
         this.readinessState = "degraded";
         this.lastInitError = error;
+
+        // §12.2 — engine.init telemetry (degraded path, BEFORE re-throw)
+        this.telemetry?.emit({
+          event: "engine.init",
+          timestamp: new Date().toISOString(),
+          fromCache: false,
+          buildMs: Date.now() - initStart,
+          unigramCount: 0,
+          bigramCount: 0,
+          outcome: "degraded",
+          cause: error instanceof Error ? error.message : String(error),
+        });
+
         throw error;
       } finally {
-        // Clear after completion (success or failure) so that future calls
-        // either no-op (ready) or restart (degraded).
         this.inFlightInit = undefined;
       }
     })();
@@ -213,65 +315,274 @@ export class CorrectionEngine {
     return this.inFlightInit;
   }
 
-  shouldCorrect(word: string): CorrectionResult {
-    if (!this.eligibleRegex().test(word)) {
+  /**
+   * Determine whether and how to correct a token.
+   *
+   * Runs lookup-then-rerank and (when eligible) word-segmentation head-to-head.
+   * Returns the higher-scoring result. When ctx is omitted the rerank module
+   * falls back to unigram-only ranking.
+   */
+  shouldCorrect(token: string, ctx: CorrectionContext = {}): CorrectionResult {
+    const callStart = Date.now();
+
+    // 1. Eligibility gate: regex / length
+    if (!this.eligibleRegex().test(token)) {
+      this.telemetry?.emit({
+        event: "correction.skipped",
+        timestamp: new Date().toISOString(),
+        tokenLength: token.length,
+        reason: "not_eligible",
+        token: null,
+        lineText: null,
+        cursor: null,
+      });
       return { corrected: false };
     }
 
-    if (this.readinessState !== "ready" || !this.symspell) {
+    if (this.readinessState !== "ready" || !this.symspell || !this.rerank) {
       return { corrected: false };
     }
 
-    const lower = word.toLowerCase();
-    // Compute per-word effective edit distance from the adaptive curve.
-    // Edit distance trades typo coverage for false positives — tech-dict
-    // layer guards known terms. Driven by config (default 2 ceiling).
-    const suggestion = this.symspell.lookup(lower, Verbosity.Top, this.effectiveEditDistance(word.length))[0];
+    const lower = token.toLowerCase();
+    const effectiveED = this.effectiveEditDistance(token.length);
 
-    if (!suggestion) {
-      return { corrected: false };
-    }
+    // 2. Lookup path: Verbosity.All + rerank
+    const lookupStart = Date.now();
+    const candidates = this.symspell.lookup(lower, Verbosity.All, effectiveED);
+    const lookupMs = Date.now() - lookupStart;
 
-    // SymSpell agrees the lowered word is already valid. Apply mixed-case
-    // normalization if needed; the tech/learned dictionaries are not consulted
-    // here because their job is to *suppress* spelling changes, not to block
-    // case normalization of an otherwise-valid word.
-    if (suggestion.term === lower) {
-      if (!hasMixedCase(word)) {
-        return { corrected: false };
+    const { winner, scoresPerCandidate } = this.rerank.rerank(token, candidates, ctx);
+
+    let sLookup: number;
+    if (winner === null) {
+      sLookup = -Infinity;
+    } else {
+      if (scoresPerCandidate.length > 0) {
+        // Full scoring path: find winner in breakdown array.
+        const entry = scoresPerCandidate.find((e) => e.term === winner.term);
+        sLookup = entry !== undefined ? entry.scores.total : -Infinity;
+      } else {
+        // Bypass path (no context or context-rerank disabled):
+        // derive a proxy score from the winner's unigram frequency.
+        sLookup = Math.log10(winner.count > 0 ? winner.count / SymSpell.N : 1 / SymSpell.N);
       }
 
-      return {
-        corrected: true,
-        suggestion: suggestion.term.toLowerCase(),
-      };
+      // Suppress SPELLING CHANGES for learned / tech words.
+      // NOT applied for identity (winner.term === lower) so that mixed-case
+      // tokens like "tHe" are still case-normalised even when "the" is in
+      // the tech dict (T09 regression contract).
+      if (winner.term !== lower && (this.isLearned(lower) || this.techDict.has(lower))) {
+        sLookup = -Infinity;
+      }
     }
 
-    // SymSpell would change the word. Suppress the change when the original
-    // (case-insensitive) form is a known tech term or learned word.
-    if (this.isLearned(lower) || this.techDict.has(lower)) {
-      return { corrected: false };
+    // 3. Segmentation path
+    let sSegmentation = -Infinity;
+    let segResult: CorrectionResult = { corrected: false };
+
+    // Learned / tech words are NEVER segmented (design.md Decision / §7 spec).
+    const inAnyDict = this.isLearned(lower) || this.techDict.has(lower);
+    if (!inAnyDict && this.getEnableSegmentation() && token.length >= this.getSegmentationMinLength()) {
+      const seg = this.tryWordSegmentation(token, ctx, sLookup);
+      sSegmentation = seg.score;
+      segResult = seg.result;
     }
+
+    // 4. Head-to-head comparison
+    const totalMs = Date.now() - callStart;
+    const scoresVsAlt =
+      sLookup > -Infinity && sSegmentation > -Infinity
+        ? { lookupScore: sLookup, segmentationScore: sSegmentation }
+        : null;
+
+    if (sSegmentation > sLookup) {
+      const sr = segResult as { corrected: true; kind: "segmentation"; suggestion: string; segments: string[] };
+      this.telemetry?.emit({
+        event: "correction.applied",
+        timestamp: new Date().toISOString(),
+        kind: "segmentation",
+        tokenLength: token.length,
+        suggestionLength: sr.suggestion.length,
+        candidateCount: candidates.length,
+        winningEditDistance: null,
+        latencyMs: totalMs,
+        scores: null,
+        scoresVsAlt,
+        token: null,
+        suggestion: null,
+        original: null,
+        candidates: null,
+        lineText: null,
+        cursor: null,
+      });
+      this.telemetry?.emit({
+        event: "lookup.latency",
+        timestamp: new Date().toISOString(),
+        tokenLength: token.length,
+        candidateCount: candidates.length,
+        latencyMs: lookupMs,
+        result: "skipped",
+        token: null,
+        suggestion: null,
+        lineText: null,
+        cursor: null,
+      });
+      return segResult;
+    }
+
+    // tie-breaker: lookup wins on equal finite scores
+    if (sLookup > -Infinity) {
+      let suggestion: string;
+      if (winner!.term === lower) {
+        // Rerank returned the identity candidate because the input is mixed-case
+        // (all-lowercase identity is suppressed by rerank; this case means
+        // token !== token.toLowerCase()). Return the lowercased form.
+        suggestion = winner!.term;
+      } else {
+        suggestion = preserveCase(token, winner!.term);
+      }
+
+      const winnerEntry = scoresPerCandidate.find((e) => e.term === winner!.term);
+      this.telemetry?.emit({
+        event: "correction.applied",
+        timestamp: new Date().toISOString(),
+        kind: "lookup",
+        tokenLength: token.length,
+        suggestionLength: suggestion.length,
+        candidateCount: candidates.length,
+        winningEditDistance: winner!.distance,
+        latencyMs: totalMs,
+        scores: winnerEntry ? winnerEntry.scores : null,
+        scoresVsAlt,
+        token: null,
+        suggestion: null,
+        original: null,
+        candidates: null,
+        lineText: null,
+        cursor: null,
+      });
+      this.telemetry?.emit({
+        event: "lookup.latency",
+        timestamp: new Date().toISOString(),
+        tokenLength: token.length,
+        candidateCount: candidates.length,
+        latencyMs: lookupMs,
+        result: "corrected",
+        token: null,
+        suggestion: null,
+        lineText: null,
+        cursor: null,
+      });
+      return { corrected: true, kind: "lookup", suggestion };
+    }
+
+    // Both paths -Infinity: no correction.
+    const skipReason = candidates.length === 0 ? "no_candidates" : "in_dict";
+    this.telemetry?.emit({
+      event: "correction.skipped",
+      timestamp: new Date().toISOString(),
+      tokenLength: token.length,
+      reason: skipReason,
+      token: null,
+      lineText: null,
+      cursor: null,
+    });
+    this.telemetry?.emit({
+      event: "lookup.latency",
+      timestamp: new Date().toISOString(),
+      tokenLength: token.length,
+      candidateCount: candidates.length,
+      latencyMs: lookupMs,
+      result: "skipped",
+      token: null,
+      suggestion: null,
+      lineText: null,
+      cursor: null,
+    });
+    return { corrected: false };
+  }
+
+  /**
+   * Attempt word-segmentation correction via SymSpell.wordSegmentation().
+   *
+   * Returns the result and its log-space score so the caller can compare
+   * against the lookup path. Returns score: -Infinity when any gate fails.
+   *
+   * @param token   Raw input token (original case).
+   * @param ctx     Context (reserved for future diagnostics).
+   * @param sLookup Lookup score (informational only; §7.1 — not used for short-circuit).
+   */
+  private tryWordSegmentation(
+    token: string,
+    _ctx: CorrectionContext,
+    _sLookup: number,
+  ): { result: CorrectionResult; score: number } {
+    const rejected: { result: CorrectionResult; score: number } = {
+      result: { corrected: false },
+      score: -Infinity,
+    };
+
+    // Defensive re-check (caller already gates; guards direct callers).
+    if (!this.getEnableSegmentation() || token.length < this.getSegmentationMinLength()) {
+      return rejected;
+    }
+
+    const segStart = Date.now();
+    const segResult = this.symspell!.wordSegmentation(
+      token.toLowerCase(),
+      this.getSegmentationMaxEditDistance(),
+    );
+    const latencyMs = Date.now() - segStart;
+
+    const { correctedString, probabilityLogSum } = segResult;
+
+    // Acceptance gates (§7.4)
+    const hasSpace = correctedString.includes(" ");
+    const segments = correctedString.split(/\s+/);
+    const minWL = this.getMinWordLength();
+    const allSegmentsLongEnough = segments.every((s) => s.length >= minWL);
+    const allSegmentsAlphabetic = segments.every((s) => /^[A-Za-z]+$/.test(s));
+    const aboveFloor = probabilityLogSum >= this.getSegmentationLogProbFloor();
+    const notIdentity = correctedString.toLowerCase() !== token.toLowerCase();
+
+    const accepted =
+      hasSpace && allSegmentsLongEnough && allSegmentsAlphabetic && aboveFloor && notIdentity;
+
+    this.telemetry?.emit({
+      event: "segmentation.attempt",
+      timestamp: new Date().toISOString(),
+      tokenLength: token.length,
+      accepted,
+      segmentCount: accepted ? segments.length : null,
+      probabilityLogSum,
+      latencyMs,
+      token: null,
+      suggestion: null,
+    });
+
+    if (!accepted) return rejected;
+
+    // First-segment-only case preservation (§7.5)
+    const firstSegCased = preserveCase(token, segments[0]);
+    const caseAdjustedSegments = [firstSegCased, ...segments.slice(1).map((s) => s.toLowerCase())];
+    const caseAdjustedString = caseAdjustedSegments.join(" ");
+
+    const score = probabilityLogSum + this.getSegmentationVsLookupBias();
 
     return {
-      corrected: true,
-      suggestion: preserveCase(word, suggestion.term),
+      result: {
+        corrected: true,
+        kind: "segmentation",
+        suggestion: caseAdjustedString,
+        segments: caseAdjustedSegments,
+      },
+      score,
     };
   }
 
   /**
    * Compute the per-word effective edit distance using the adaptive curve:
    *   ED(L) = clamp(minED + floor((L - minWL) / step), minED, maxED)
-   *
-   * All four inputs are snapshotted once at the top so that a transient
-   * inconsistency between live accessors (e.g. minED briefly > maxED during a
-   * config rebuild) never causes lookup() to receive a per-call distance
-   * greater than the index ceiling and never throws. The defensive clamp
-   * `effectiveMin = Math.min(minED, maxED)` is the key guard.
-   *
-   * Math.max(step, 1) defends against a misbehaving accessor returning 0 or
-   * a negative value; the config layer rejects those at write time, but the
-   * engine adds a belt-and-suspenders guard at call time.
    */
   private effectiveEditDistance(wordLength: number): number {
     const minED = this.getMinEditDistance();
@@ -279,41 +590,17 @@ export class CorrectionEngine {
     const step = this.getEditDistanceStepEvery();
     const minWL = this.getMinWordLength();
 
-    // Defensive clamp: if the live accessor briefly returns minED > maxED
-    // (transient inconsistency during config rebuild), cap the floor at maxED
-    // so we never pass a per-call distance larger than the index ceiling.
     const effectiveMin = Math.min(minED, maxED);
-
     const intermediate = effectiveMin + Math.floor((wordLength - minWL) / Math.max(step, 1));
     return Math.max(effectiveMin, Math.min(intermediate, maxED));
   }
 
   /**
-   * Load the English unigram dictionary into the given SymSpell instance.
-   *
-   * Default path: read <pkgRoot>/data/frequency_dictionary_en_82_765.txt and
-   * call symspell.loadDictionary(text, 0, 1), loading only unigrams. This
-   * skips the bigram file entirely, saving ~24 MB resident memory and ~30% of
-   * cold-start build time vs. upstream loadDefaultDictionaries.
-   *
-   * Fallback (resolver failure): call upstream loadDefaultDictionaries, which
-   * loads bigrams as a side effect. Correctness is preserved; the optimization
-   * is not. See design.md §"Drop bigrams entirely" for full rationale.
+   * Load the English unigram and bigram dictionaries into the given SymSpell
+   * instance via the upstream `loadDefaultDictionaries` API from `symspell-ts`.
    */
   private async loadDictionaries(symspell: SymSpell): Promise<void> {
-    const pkgRoot = this.resolveSymspellPackageRoot();
-
-    if (pkgRoot !== null) {
-      const dictPath = join(pkgRoot, "data", "frequency_dictionary_en_82_765.txt");
-      const text = await readFile(dictPath, "utf8");
-      symspell.loadDictionary(text, 0, 1);
-    } else {
-      console.info(
-        "[mobile-autocorrect] symspell-ts package root not resolvable; " +
-          "falling back to upstream loadDefaultDictionaries (bigrams will be loaded as a side effect)",
-      );
-      loadDefaultDictionaries(symspell);
-    }
+    loadDefaultDictionaries(symspell);
   }
 
   private eligibleRegex(): RegExp {
@@ -321,12 +608,43 @@ export class CorrectionEngine {
     if (this.cachedEligibleRegex?.minLength === minLength) {
       return this.cachedEligibleRegex.pattern;
     }
-    // Sanitize: a non-integer or out-of-range value would have been
-    // rejected at config write time, but defend against a buggy accessor.
     const safeMinLength = Number.isInteger(minLength) && minLength >= 1 ? minLength : FALLBACK_MIN_WORD_LENGTH;
     const pattern = new RegExp(`^[A-Za-z]{${safeMinLength},}$`);
     this.cachedEligibleRegex = { minLength, pattern };
     return pattern;
+  }
+
+  /**
+   * Attach the trigram table to the rerank module if this engine instance
+   * still owns the current generation and is in the "ready" state.
+   *
+   * Orphan-generation guard: `ownerGen` is the generation captured at the
+   * time the lazy-attach started (inside initialize(), after "ready" is set).
+   * If the live generation has changed since then, this engine has been
+   * superseded by a rebuild — silently return without attaching.
+   */
+  private attachIfStillOwning(table: TrigramTable | null, ownerGen: number): void {
+    if (table === null) return;
+    if (ownerGen !== this.getOwnerGeneration()) return;
+    if (this.readinessState !== "ready") return;
+    this.rerank!.attachTrigramTable(table);
+  }
+
+  /**
+   * Resolve the project’s `data/` directory relative to this module’s location.
+   *
+   * In development (vitest runs TypeScript directly):
+   *   src/correction-engine.ts → dirname = src/ → ../data = data/ (repo root)
+   * In a `dist/src/correction-engine.js` layout (compiled output, scenario
+   * harness via `-e ./dist/index.js`):
+   *   dist/src/ → ../data = dist/data/ which does not exist; fall back to
+   *   ../../data = repo-root data/.
+   */
+  private resolveProjectDataDir(): string {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const sibling = resolve(here, "../data");
+    if (existsSync(sibling)) return sibling;
+    return resolve(here, "../../data");
   }
 }
 
@@ -344,10 +662,6 @@ function preserveCase(original: string, suggestion: string): string {
   }
 
   return suggestion.toLowerCase();
-}
-
-function hasMixedCase(word: string): boolean {
-  return word !== word.toLowerCase() && word !== word.toUpperCase() && !isTitleCase(word);
 }
 
 function isTitleCase(word: string): boolean {

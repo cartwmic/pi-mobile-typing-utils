@@ -1,4 +1,4 @@
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -679,7 +679,7 @@ describe("createTyposCommand", () => {
 
     expect(ctx.notifications).toEqual([
       {
-        message: "Unknown command. Usage: /typos [on|off|dict ...|default ...|config ...]",
+        message: "Unknown command. Usage: /typos [on|off|dict ...|default ...|config ...|stats ...]",
         level: "warning",
       },
       { message: "Usage: /typos dict [search <term>|add <word>|remove <word>|clear]", level: "warning" },
@@ -703,6 +703,7 @@ describe("createTyposCommand", () => {
       { label: "dict", value: "dict" },
       { label: "default", value: "default" },
       { label: "config", value: "config" },
+      { label: "stats", value: "stats" },
     ]);
     expect(command.getArgumentCompletions("o")?.map((item) => item.value)).toEqual(["on", "off"]);
     expect(command.getArgumentCompletions("d")?.map((item) => item.value)).toEqual(["dict", "default"]);
@@ -974,7 +975,7 @@ describe("createTyposCommand", () => {
     await command.handler("config wibble 5", ctx);
 
     expect(ctx.notifications.at(-1)).toEqual({
-      message: "Usage: /typos config [defaultMode|maxEditDistance|minWordLength|minEditDistance|editDistanceStepEvery] [<value>]",
+      message: "Usage: /typos config [defaultMode|maxEditDistance|minWordLength|minEditDistance|editDistanceStepEvery|enableSegmentation|segmentationMinLength|segmentationMaxEditDistance|segmentationLogProbFloor|segmentationVsLookupBias|enableContextRerank|rerankBigramWeight|rerankTrigramWeight|rerankEditDistancePenalty|telemetry] [<value>]",
       level: "warning",
     });
   });
@@ -1679,6 +1680,710 @@ describe("createTyposCommand", () => {
     const filePath = join(tempDir, `config-${randomUUID()}.json`);
     return new Config({ filePath });
   }
+
+  // ---------------------------------------------------------------------------
+  // §11.10 — New config key set/get/reject tests
+  // ---------------------------------------------------------------------------
+
+  test("11.10: enableSegmentation set/get/reject", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    await config.load();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    // Valid set
+    await command.handler("config enableSegmentation false", ctx);
+    expect(config.getEnableSegmentation()).toBe(false);
+    expect(ctx.notifications.at(-1)?.message).toBe("enableSegmentation set to false");
+
+    // Already same value
+    await command.handler("config enableSegmentation false", ctx);
+    expect(ctx.notifications.at(-1)?.message).toBe("enableSegmentation is already false");
+
+    // Invalid
+    await command.handler("config enableSegmentation maybe", ctx);
+    expect(ctx.notifications.at(-1)?.level).toBe("warning");
+    expect(ctx.notifications.at(-1)?.message).toContain("true|false");
+  });
+
+  test("11.10: segmentationMinLength set/get/reject", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    await config.load();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("config segmentationMinLength 8", ctx);
+    expect(config.getSegmentationMinLength()).toBe(8);
+    expect(ctx.notifications.at(-1)?.message).toBe("segmentationMinLength set to 8");
+
+    // Out of range
+    await command.handler("config segmentationMinLength 3", ctx);
+    expect(ctx.notifications.at(-1)?.level).toBe("warning");
+
+    await command.handler("config segmentationMinLength 13", ctx);
+    expect(ctx.notifications.at(-1)?.level).toBe("warning");
+
+    // Non-integer
+    await command.handler("config segmentationMinLength abc", ctx);
+    expect(ctx.notifications.at(-1)?.level).toBe("warning");
+  });
+
+  test("11.10: segmentationMaxEditDistance set/get/reject", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    await config.load();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("config segmentationMaxEditDistance 2", ctx);
+    expect(config.getSegmentationMaxEditDistance()).toBe(2);
+    expect(ctx.notifications.at(-1)?.message).toBe("segmentationMaxEditDistance set to 2");
+
+    await command.handler("config segmentationMaxEditDistance 3", ctx);
+    expect(ctx.notifications.at(-1)?.level).toBe("warning");
+  });
+
+  test("11.10: segmentationLogProbFloor set/get/reject", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    await config.load();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("config segmentationLogProbFloor -15", ctx);
+    expect(config.getSegmentationLogProbFloor()).toBe(-15);
+    expect(ctx.notifications.at(-1)?.message).toBe("segmentationLogProbFloor set to -15");
+
+    await command.handler("config segmentationLogProbFloor -31", ctx);
+    expect(ctx.notifications.at(-1)?.level).toBe("warning");
+
+    await command.handler("config segmentationLogProbFloor 1", ctx);
+    expect(ctx.notifications.at(-1)?.level).toBe("warning");
+  });
+
+  test("11.10: segmentationVsLookupBias set/get/reject", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    await config.load();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("config segmentationVsLookupBias 2.5", ctx);
+    expect(config.getSegmentationVsLookupBias()).toBe(2.5);
+    expect(ctx.notifications.at(-1)?.message).toBe("segmentationVsLookupBias set to 2.5");
+
+    await command.handler("config segmentationVsLookupBias 11", ctx);
+    expect(ctx.notifications.at(-1)?.level).toBe("warning");
+  });
+
+  test("11.10: enableContextRerank set/get/reject", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    await config.load();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("config enableContextRerank false", ctx);
+    expect(config.getEnableContextRerank()).toBe(false);
+    expect(ctx.notifications.at(-1)?.message).toBe("enableContextRerank set to false");
+
+    await command.handler("config enableContextRerank notabool", ctx);
+    expect(ctx.notifications.at(-1)?.level).toBe("warning");
+  });
+
+  test("11.10: rerankBigramWeight set/get/reject", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    await config.load();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("config rerankBigramWeight 0.7", ctx);
+    expect(config.getRerankBigramWeight()).toBe(0.7);
+    expect(ctx.notifications.at(-1)?.message).toBe("rerankBigramWeight set to 0.7");
+
+    await command.handler("config rerankBigramWeight 1.5", ctx);
+    expect(ctx.notifications.at(-1)?.level).toBe("warning");
+
+    await command.handler("config rerankBigramWeight -0.1", ctx);
+    expect(ctx.notifications.at(-1)?.level).toBe("warning");
+  });
+
+  test("11.10: rerankTrigramWeight set/get/reject", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    await config.load();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("config rerankTrigramWeight 0.2", ctx);
+    expect(config.getRerankTrigramWeight()).toBe(0.2);
+    expect(ctx.notifications.at(-1)?.message).toBe("rerankTrigramWeight set to 0.2");
+
+    await command.handler("config rerankTrigramWeight 2", ctx);
+    expect(ctx.notifications.at(-1)?.level).toBe("warning");
+  });
+
+  test("11.10: rerankEditDistancePenalty set/get/reject", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    await config.load();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("config rerankEditDistancePenalty 3.0", ctx);
+    expect(config.getRerankEditDistancePenalty()).toBe(3.0);
+    expect(ctx.notifications.at(-1)?.message).toBe("rerankEditDistancePenalty set to 3");
+
+    await command.handler("config rerankEditDistancePenalty 6", ctx);
+    expect(ctx.notifications.at(-1)?.level).toBe("warning");
+
+    await command.handler("config rerankEditDistancePenalty -1", ctx);
+    expect(ctx.notifications.at(-1)?.level).toBe("warning");
+  });
+
+  test("11.10: telemetry set/get/reject", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    await config.load();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("config telemetry debug", ctx);
+    expect(config.getTelemetry()).toBe("debug");
+    expect(ctx.notifications.at(-1)?.message).toBe("telemetry set to debug");
+
+    await command.handler("config telemetry off", ctx);
+    expect(config.getTelemetry()).toBe("off");
+
+    await command.handler("config telemetry loud", ctx);
+    expect(ctx.notifications.at(-1)?.level).toBe("warning");
+    expect(ctx.notifications.at(-1)?.message).toContain("off|metrics|debug");
+  });
+
+  test("11.10: engine-rebuild invariant: only maxEditDistance drops engine, enableSegmentation does not", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    await config.load();
+    const initDeferred = createDeferred<void>();
+    const fakeEngine = makeFakeEngine(initDeferred, "ready");
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+      createCorrectionEngine: () => fakeEngine as never,
+      createAutocorrectEditor: (() => ({})) as never,
+    });
+    const ctx = createCommandContext();
+
+    // Enable autocorrect so engine is constructed
+    await command.handler("on", ctx);
+    const engineBefore = command.state.engine;
+    const genBefore = command.state.generation;
+
+    // Toggling enableSegmentation must NOT drop the engine
+    await command.handler("config enableSegmentation false", ctx);
+    expect(command.state.engine).toBe(engineBefore);
+    expect(command.state.generation).toBe(genBefore);
+  });
+
+  // ---------------------------------------------------------------------------
+  // §11.10 — Autocomplete includes new config keys
+  // ---------------------------------------------------------------------------
+
+  test("11.10: autocomplete second-level config lists all new keys in spec order", async () => {
+    const dictionary = await createDictionary();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
+    });
+
+    const completions = command.getArgumentCompletions("config ");
+    expect(completions).not.toBeNull();
+    const keys = completions!.map((c) => c.label);
+
+    // Check the new keys appear in order
+    const expectedNewKeys = [
+      "enableSegmentation",
+      "segmentationMinLength",
+      "segmentationMaxEditDistance",
+      "segmentationLogProbFloor",
+      "segmentationVsLookupBias",
+      "enableContextRerank",
+      "rerankBigramWeight",
+      "rerankTrigramWeight",
+      "rerankEditDistancePenalty",
+      "telemetry",
+    ];
+    for (const key of expectedNewKeys) {
+      expect(keys).toContain(key);
+    }
+
+    // Verify order of full key sequence
+    const fullExpected = [
+      "defaultMode",
+      "maxEditDistance",
+      "minWordLength",
+      "minEditDistance",
+      "editDistanceStepEvery",
+      "enableSegmentation",
+      "segmentationMinLength",
+      "segmentationMaxEditDistance",
+      "segmentationLogProbFloor",
+      "segmentationVsLookupBias",
+      "enableContextRerank",
+      "rerankBigramWeight",
+      "rerankTrigramWeight",
+      "rerankEditDistancePenalty",
+      "telemetry",
+    ];
+    expect(keys).toEqual(fullExpected);
+  });
+
+  test("11.10: third-level autocomplete for boolean keys (enableSegmentation, enableContextRerank)", async () => {
+    const dictionary = await createDictionary();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
+    });
+
+    const segCompletions = command.getArgumentCompletions("config enableSegmentation ");
+    expect(segCompletions?.map((c) => c.label)).toEqual(["true", "false"]);
+
+    const rerankCompletions = command.getArgumentCompletions("config enableContextRerank ");
+    expect(rerankCompletions?.map((c) => c.label)).toEqual(["true", "false"]);
+  });
+
+  test("11.10: third-level autocomplete for telemetry enum key", async () => {
+    const dictionary = await createDictionary();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
+    });
+
+    const telCompletions = command.getArgumentCompletions("config telemetry ");
+    expect(telCompletions?.map((c) => c.label)).toEqual(["off", "metrics", "debug"]);
+  });
+
+  test("11.10: third-level autocomplete for segmentationMinLength integer range", async () => {
+    const dictionary = await createDictionary();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
+    });
+
+    const completions = command.getArgumentCompletions("config segmentationMinLength ");
+    expect(completions?.map((c) => c.label)).toEqual(["4", "5", "6", "7", "8", "9", "10", "11", "12"]);
+  });
+
+  test("11.10: third-level autocomplete for segmentationMaxEditDistance integer range", async () => {
+    const dictionary = await createDictionary();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
+    });
+
+    const completions = command.getArgumentCompletions("config segmentationMaxEditDistance ");
+    expect(completions?.map((c) => c.label)).toEqual(["0", "1", "2"]);
+  });
+
+  test("11.10: third-level autocomplete for free-form numeric keys returns null", async () => {
+    const dictionary = await createDictionary();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
+    });
+
+    expect(command.getArgumentCompletions("config segmentationLogProbFloor ")).toBeNull();
+    expect(command.getArgumentCompletions("config segmentationVsLookupBias ")).toBeNull();
+    expect(command.getArgumentCompletions("config rerankBigramWeight ")).toBeNull();
+    expect(command.getArgumentCompletions("config rerankTrigramWeight ")).toBeNull();
+    expect(command.getArgumentCompletions("config rerankEditDistancePenalty ")).toBeNull();
+  });
+
+  test("11.9: stats subcommand autocomplete", async () => {
+    const dictionary = await createDictionary();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
+    });
+
+    const completions = command.getArgumentCompletions("stats ");
+    expect(completions?.map((c) => c.label)).toEqual(["24h", "7d", "all", "reset"]);
+
+    const filtered = command.getArgumentCompletions("stats 2");
+    expect(filtered?.map((c) => c.label)).toEqual(["24h"]);
+  });
+
+  // ---------------------------------------------------------------------------
+  // §11.6 — /typos stats command
+  // ---------------------------------------------------------------------------
+
+  test("11.6: /typos stats reports 'telemetry disabled' when no cacheDir", async () => {
+    const dictionary = await createDictionary();
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config: createConfig(),
+      // No cacheDir provided
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("stats", ctx);
+    expect(ctx.notifications.at(-1)?.message).toContain("disabled");
+  });
+
+  test("11.6: /typos stats produces summary from fixture NDJSON", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const cacheDir = join(tempDir, "cache");
+    const telemetryDir = join(cacheDir, "telemetry");
+    await mkdir(telemetryDir, { recursive: true });
+
+    const today = new Date();
+    const dateStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+    const ndjsonFile = join(telemetryDir, `events-${dateStr}.ndjson`);
+
+    const events = [
+      { event: "correction.applied", timestamp: new Date().toISOString(), kind: "lookup", latencyMs: 10 },
+      { event: "correction.applied", timestamp: new Date().toISOString(), kind: "lookup", latencyMs: 20 },
+      { event: "correction.applied", timestamp: new Date().toISOString(), kind: "segmentation", latencyMs: 5 },
+      { event: "correction.rejected", timestamp: new Date().toISOString(), kind: "lookup" },
+      {
+        event: "engine.init",
+        timestamp: new Date().toISOString(),
+        fromCache: true,
+        buildMs: 50,
+        unigramCount: 1000,
+        bigramCount: 500,
+        outcome: "ready",
+        cause: null,
+      },
+    ];
+    await writeFile(ndjsonFile, events.map((e) => JSON.stringify(e)).join("\n"));
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+      cacheDir,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("stats", ctx);
+
+    const msg = ctx.notifications.at(-1)?.message ?? "";
+    expect(msg).toContain("Mobile autocorrect telemetry summary");
+    expect(msg).toContain("corrections applied: 3");
+    expect(msg).toContain("corrections rejected: 1");
+    expect(msg).toContain("acceptance rate:");
+  });
+
+  test("11.11: /typos stats empty telemetry dir produces 'No autocorrect telemetry recorded'", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const cacheDir = join(tempDir, "cache-empty");
+    const telemetryDir = join(cacheDir, "telemetry");
+    await mkdir(telemetryDir, { recursive: true });
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+      cacheDir,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("stats", ctx);
+
+    const msg = ctx.notifications.at(-1)?.message ?? "";
+    expect(msg).toContain("No autocorrect telemetry recorded");
+  });
+
+  // ---------------------------------------------------------------------------
+  // §11.8 — /typos stats reset two-step confirmation
+  // ---------------------------------------------------------------------------
+
+  test("11.8: /typos stats reset first invocation prompts, does not delete", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const cacheDir = join(tempDir, "cache-reset1");
+    const telemetryDir = join(cacheDir, "telemetry");
+    await mkdir(telemetryDir, { recursive: true });
+
+    const today = new Date();
+    const dateStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+    const ndjsonFile = join(telemetryDir, `events-${dateStr}.ndjson`);
+    await writeFile(ndjsonFile, `{"event":"engine.init","timestamp":"${new Date().toISOString()}"}\n`);
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+      cacheDir,
+    });
+    const ctx = createCommandContext();
+
+    await command.handler("stats reset", ctx);
+
+    expect(ctx.notifications.at(-1)?.message).toContain("30 seconds");
+    expect(ctx.notifications.at(-1)?.level).toBe("warning");
+    expect(command.state.pendingResetAt).not.toBeNull();
+
+    // File should still exist
+    const { existsSync } = await import("node:fs");
+    expect(existsSync(ndjsonFile)).toBe(true);
+  });
+
+  test("11.8: /typos stats reset second invocation within 30s deletes files", async () => {
+    vi.useFakeTimers();
+
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const cacheDir = join(tempDir, "cache-reset2");
+    const telemetryDir = join(cacheDir, "telemetry");
+    await mkdir(telemetryDir, { recursive: true });
+
+    const today = new Date();
+    const dateStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+    const ndjsonFile = join(telemetryDir, `events-${dateStr}.ndjson`);
+    await writeFile(ndjsonFile, `{"event":"engine.init"}\n`);
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+      cacheDir,
+    });
+    const ctx = createCommandContext();
+
+    // First invocation
+    await command.handler("stats reset", ctx);
+    expect(command.state.pendingResetAt).not.toBeNull();
+
+    // Advance time by 10 seconds (within window)
+    vi.advanceTimersByTime(10_000);
+
+    // Second invocation — should delete
+    await command.handler("stats reset", ctx);
+    expect(command.state.pendingResetAt).toBeNull();
+    expect(ctx.notifications.at(-1)?.message).toContain("deleted 1 files");
+
+    vi.useRealTimers();
+  });
+
+  test("11.8: /typos stats reset second invocation after 30s re-prompts", async () => {
+    vi.useFakeTimers();
+
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const cacheDir = join(tempDir, "cache-reset3");
+    const telemetryDir = join(cacheDir, "telemetry");
+    await mkdir(telemetryDir, { recursive: true });
+
+    const today = new Date();
+    const dateStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+    const ndjsonFile = join(telemetryDir, `events-${dateStr}.ndjson`);
+    await writeFile(ndjsonFile, `{"event":"engine.init"}\n`);
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+      cacheDir,
+    });
+    const ctx = createCommandContext();
+
+    // First invocation
+    await command.handler("stats reset", ctx);
+    const firstPendingAt = command.state.pendingResetAt;
+
+    // Advance time by 31 seconds (outside window)
+    vi.advanceTimersByTime(31_000);
+
+    // Second invocation — should re-prompt (NOT delete)
+    await command.handler("stats reset", ctx);
+    expect(ctx.notifications.at(-1)?.message).toContain("30 seconds");
+    expect(ctx.notifications.at(-1)?.level).toBe("warning");
+    // pendingResetAt should be reset to a new (later) timestamp
+    expect(command.state.pendingResetAt).not.toBeNull();
+    expect(command.state.pendingResetAt).not.toBe(firstPendingAt);
+
+    // File should still exist
+    const { existsSync } = await import("node:fs");
+    expect(existsSync(ndjsonFile)).toBe(true);
+
+    vi.useRealTimers();
+  });
+
+  test("11.8: /typos stats reset when telemetry dir doesn't exist reports no telemetry", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const cacheDir = join(tempDir, "cache-reset-nodir");
+    // NOT creating the telemetry dir
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+      cacheDir,
+    });
+    const ctx = createCommandContext();
+
+    // First invocation prompts
+    await command.handler("stats reset", ctx);
+    expect(command.state.pendingResetAt).not.toBeNull();
+
+    // Second invocation within window tries to delete, dir doesn't exist
+    await command.handler("stats reset", ctx);
+    const msg = ctx.notifications.at(-1)?.message ?? "";
+    expect(msg).toMatch(/no telemetry/i);
+  });
+
+  // ---------------------------------------------------------------------------
+  // §11.11 — Aggregator p50/p95 math and range filtering
+  // ---------------------------------------------------------------------------
+
+  test("11.11: /typos stats aggregator p50/p95 math correct for known-shape latency", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const cacheDir = join(tempDir, "cache-p50p95");
+    const telemetryDir = join(cacheDir, "telemetry");
+    await mkdir(telemetryDir, { recursive: true });
+
+    // Build 100 lookup events with known latencies [1, 2, ..., 100]
+    const now = Date.now();
+    const today = new Date();
+    const dateStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+    const ndjsonFile = join(telemetryDir, `events-${dateStr}.ndjson`);
+    const lines = [];
+    for (let i = 1; i <= 100; i++) {
+      lines.push(
+        JSON.stringify({
+          event: "correction.applied",
+          timestamp: new Date(now - 3600 * 1000 + i * 100).toISOString(),
+          kind: "lookup",
+          latencyMs: i,
+        }),
+      );
+    }
+    await writeFile(ndjsonFile, lines.join("\n"));
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+      cacheDir,
+    });
+    const ctx = createCommandContext();
+    await command.handler("stats 24h", ctx);
+
+    const msg = ctx.notifications.at(-1)?.message ?? "";
+    // p50 = Math.floor(100 * 0.5) = 50th index = value 51 (1-indexed array)
+    // p95 = Math.floor(100 * 0.95) = 95th index = value 96
+    expect(msg).toContain("p50: 51.00ms");
+    expect(msg).toContain("p95: 96.00ms");
+  });
+
+  test("11.11: range filtering produces different counts on same fixture set", async () => {
+    const dictionary = await createDictionary();
+    const config = createConfig();
+    const cacheDir = join(tempDir, "cache-ranges");
+    const telemetryDir = join(cacheDir, "telemetry");
+    await mkdir(telemetryDir, { recursive: true });
+
+    const now = Date.now();
+    const day = 24 * 3600 * 1000;
+
+    // Helper to format a date as YYYY-MM-DD
+    function fmtDate(ms: number): string {
+      const d = new Date(ms);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    }
+
+    // Create events spread across 10 days
+    for (let daysAgo = 0; daysAgo < 10; daysAgo++) {
+      const ts = now - daysAgo * day;
+      const dateStr = fmtDate(ts);
+      const events = [
+        JSON.stringify({ event: "correction.applied", timestamp: new Date(ts).toISOString(), kind: "lookup", latencyMs: 1 }),
+      ];
+      await writeFile(join(telemetryDir, `events-${dateStr}.ndjson`), events.join("\n"));
+    }
+
+    const command = createTyposCommand({
+      learnedDictionary: dictionary,
+      techDictPath: "/tmp/tech-dict.txt",
+      config,
+      cacheDir,
+    });
+    const ctx = createCommandContext();
+
+    // 24h range should have 1 event (today)
+    await command.handler("stats 24h", ctx);
+    const msg24h = ctx.notifications.at(-1)?.message ?? "";
+    expect(msg24h).toContain("corrections applied: 1");
+
+    // 7d range should have 7 events
+    await command.handler("stats 7d", ctx);
+    const msg7d = ctx.notifications.at(-1)?.message ?? "";
+    expect(msg7d).toContain("corrections applied: 7");
+
+    // all range should have 10 events
+    await command.handler("stats all", ctx);
+    const msgAll = ctx.notifications.at(-1)?.message ?? "";
+    expect(msgAll).toContain("corrections applied: 10");
+  });
+
 });
 
 function createCommandContext(options?: { confirmResult?: boolean }): MockCommandContext {
