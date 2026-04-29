@@ -32,6 +32,8 @@ The engine SHALL use the SymSpell algorithm (Damerau-Levenshtein distance, where
 
 Candidate selection from the multi-result list SHALL be performed by the n-gram rerank module (see the `ngram-rerank` capability spec), which takes the candidate list plus a `CorrectionContext` and returns a single best correction. When `enableContextRerank` is `false`, the rerank module bypasses scoring and returns SymSpell's frequency-ordered top-1; this preserves the prior single-candidate-by-frequency contract for users who disable context awareness. The previous use of `Verbosity.Top` is no longer permitted in production code paths.
 
+Lookup is **only** invoked when the early in-dictionary guard does NOT fire (see "Early in-dictionary guard short-circuits before SymSpell lookup"). For all-lowercase tokens that are already in any of the three dictionaries, lookup is skipped entirely; the engine guard is the sole owner of identity protection in that case. The rerank module's identity-correction-suppression rule remains in effect as a defensive backstop for any candidate path that reaches the rerank with an identity match — but for the all-lowercase in-dictionary case, the rerank rule is unreachable because lookup is not called.
+
 #### Scenario: Common mobile typo with single transposition
 - **WHEN** the user types "teh" (1 transposition from "the")
 - **THEN** the engine SHALL suggest "the" as the correction (chosen via rerank from the `Verbosity.All` candidate list)
@@ -56,9 +58,13 @@ Candidate selection from the multi-result list SHALL be performed by the n-gram 
 - **WHEN** the user sets `maxEditDistance` to `4`
 - **THEN** the engine SHALL accept the value, build the SymSpell index at that ceiling, and successfully serve lookups; the engine SHALL NOT impose a soft cap below 4 even though false-positive rates are documented to climb sharply at that distance
 
-#### Scenario: Identity correction suppressed
-- **WHEN** the rerank's chosen candidate's term equals the lowercased input (i.e., the candidate at distance 0 with the highest score is the input itself)
-- **THEN** the engine SHALL return `{ corrected: false }`, NOT fire a correction event
+#### Scenario: Identity correction suppressed at engine guard for all-lowercase in-dictionary input
+- **WHEN** the user types an all-lowercase word that is present in the learned, tech, or SymSpell unigram dictionary (e.g., `they`, `make`, `kubernetes`)
+- **THEN** the engine's early in-dictionary guard SHALL fire and the engine SHALL return `{ corrected: false }` without invoking lookup; this supersedes the prior "rerank winner-equals-input" check for this case (the rerank could otherwise have picked a higher-scoring neighbor over the identity term)
+
+#### Scenario: Identity correction defensively suppressed at rerank for residual paths
+- **WHEN** for any reason a candidate list reaches the rerank where the chosen candidate's term equals the lowercased input AND the input is all-lowercase (this case is no longer reachable for in-dictionary tokens but the rerank rule is retained defensively)
+- **THEN** the rerank SHALL return a null winner per the rerank spec; the engine SHALL treat this as `S_lookup = -Infinity` and apply head-to-head with segmentation as today
 
 ### Requirement: Verify Damerau-Levenshtein semantics
 Before the engine is built, the implementation SHALL verify that symspell-ts uses Damerau-Levenshtein (transpositions = 1 edit), not plain Levenshtein (transpositions = 2 edits). If plain Levenshtein were used, the practical reach of any given `maxEditDistance` would shrink by half on transposition-style typos.
@@ -267,21 +273,21 @@ The editor SHALL populate `ctx.prev` and `ctx.prevPrev` by scanning the line tex
 - **THEN** the editor SHALL pass `ctx.prev: "want"` and `ctx.prevPrev: "i"` (both lowercased), so the rerank's bigram/trigram lookups can match the lowercased corpus keys
 
 ### Requirement: Multi-candidate lookup with rerank
-The engine SHALL invoke `SymSpell.lookup(token, Verbosity.All, effectiveED)` (instead of `Verbosity.Top`) when looking up corrections. The returned candidate list SHALL be passed through the n-gram rerank module (see `ngram-rerank` capability spec) along with the `CorrectionContext`. The rerank's single best candidate SHALL be the engine's chosen correction, subject to the existing identity-correction-suppression rule (which still applies: if the chosen candidate equals the input lowercased, return `{ corrected: false }`).
+The engine SHALL invoke `SymSpell.lookup(token, Verbosity.All, effectiveED)` (instead of `Verbosity.Top`) when looking up corrections, BUT ONLY when the early in-dictionary guard does not fire (see "Early in-dictionary guard short-circuits before SymSpell lookup"). The returned candidate list SHALL be passed through the n-gram rerank module (see `ngram-rerank` capability spec) along with the `CorrectionContext`. The rerank's single best candidate SHALL be the engine's chosen correction, subject to the rerank module's identity-correction-suppression rule (defensive: if the chosen candidate equals the input lowercased AND the input is all-lowercase, the rerank returns a null winner and the engine treats `S_lookup = -Infinity`).
 
 The rerank module (per `ngram-rerank` spec) SHALL truncate the candidate list to exactly 16 entries (`MAX_RERANK_CANDIDATES = 16`, top by SymSpell frequency) before scoring. This is a hard requirement, not optional, and is owned by the rerank module — the engine does not perform truncation separately.
 
 #### Scenario: Verbosity.All replaces Verbosity.Top in production paths
-- **WHEN** the engine performs any correction lookup
+- **WHEN** the engine performs any correction lookup (i.e., the early in-dictionary guard did not fire)
 - **THEN** the SymSpell call SHALL use `Verbosity.All`; `Verbosity.Top` SHALL NOT be called from any production code path (test code MAY still reference it for round-trip fidelity validation)
 
-#### Scenario: Identity suppression delegated to rerank module
-- **WHEN** the SymSpell `Verbosity.All` lookup returns candidates AND the rerank module's identity-suppression rule applies (chosen candidate's term equals `token.toLowerCase()` AND input is already lowercase)
-- **THEN** the rerank returns a null winner; the engine receives null, recognizes lookup produced no winner, falls through to the segmentation gate (per the segmentation-runs-when-all-candidates-identity-suppressed scenario), and if segmentation gates fail, returns `{ corrected: false }`. The engine does NOT separately apply identity suppression — the rerank module is the sole owner of that rule.
+#### Scenario: Identity suppression for all-lowercase in-dictionary tokens is owned by the engine guard
+- **WHEN** the user types an all-lowercase token that is present in any of the three dictionaries
+- **THEN** the engine's early in-dictionary guard SHALL fire and lookup SHALL NOT be invoked; the rerank module's identity-suppression rule is unreachable for this input class because no candidate list ever reaches the rerank
 
 #### Scenario: Mixed-case exact-match input is normalized to lowercase, NOT identity-suppressed
 - **WHEN** the SymSpell lookup returns one candidate `c` where `c.term === token.toLowerCase()` AND the original `token !== token.toLowerCase()` (e.g., user typed `tHe` and the dictionary has `the`)
-- **THEN** the rerank module's identity-suppression rule does NOT fire (because input is mixed-case, not all-lowercase); the rerank returns `c` as winner; the engine returns a correction normalizing the case, preserving the prior change's mixed-case-normalization contract
+- **THEN** the early in-dictionary guard does NOT fire (because the input is mixed-case); the rerank module's identity-suppression rule does NOT fire (because the input is mixed-case, not all-lowercase); the rerank returns `c` as winner; the engine returns a correction normalizing the case, preserving the prior change's mixed-case-normalization contract
 
 #### Scenario: Candidate list is bounded
 - **WHEN** the SymSpell `Verbosity.All` lookup returns more than 16 candidates
@@ -358,4 +364,38 @@ This requirement is detailed in the `ngram-rerank` capability spec ("Trigram sid
 #### Scenario: Engine ready state independent of trigram load
 - **WHEN** the engine has loaded unigrams and bigrams but the trigram lazy-load promise is still in flight
 - **THEN** `engine.getReadiness()` SHALL return `"ready"`; correction lookups SHALL succeed; the rerank's trigram tier SHALL contribute zero log-prob until trigrams attach
+
+### Requirement: Early in-dictionary guard short-circuits before SymSpell lookup
+The engine SHALL evaluate an early in-dictionary guard immediately after the eligibility regex check and before invoking `SymSpell.lookup`. The guard fires when **all** of the following hold:
+
+1. The lowercased token is present in the learned dictionary, OR the tech dictionary, OR the SymSpell unigram words map (i.e., any of the three layers).
+2. The original `token === token.toLowerCase()` (input is all-lowercase).
+
+When the guard fires, the engine SHALL return `{ corrected: false }` immediately, without invoking `SymSpell.lookup`, the rerank, or the segmentation path. The engine SHALL emit a `correction.skipped` telemetry event with `reason: "in_dictionary"` for observability.
+
+When the guard does NOT fire (because the input is mixed-case, or because the lowercased token is in none of the three dictionaries), the engine SHALL proceed to lookup-then-rerank as today, preserving the mixed-case normalization contract (`tHe → the`, `Teh → The`, `TEH → THE`).
+
+#### Scenario: All-lowercase token in SymSpell unigram dictionary skips lookup
+- **WHEN** the user types `they` (an all-lowercase word present in the bundled SymSpell unigram dictionary)
+- **THEN** the engine SHALL return `{ corrected: false }` without invoking `SymSpell.lookup`; the user's input is preserved verbatim regardless of any higher-frequency neighbor like `the` that the rerank might otherwise have picked
+
+#### Scenario: All-lowercase token in tech dictionary skips lookup
+- **WHEN** the user types `kubernetes` (present in the tech dictionary)
+- **THEN** the engine SHALL return `{ corrected: false }` without invoking `SymSpell.lookup`
+
+#### Scenario: All-lowercase token in learned dictionary skips lookup
+- **WHEN** the user has previously taught the engine the word `myproject` via the rejection-learning loop, and types `myproject` again
+- **THEN** the engine SHALL return `{ corrected: false }` without invoking `SymSpell.lookup`
+
+#### Scenario: Mixed-case in-dictionary token still flows through lookup-rerank for case normalization
+- **WHEN** the user types `tHe` (input not all-lowercase, lowercased form present in the unigram dictionary)
+- **THEN** the early guard SHALL NOT fire (the all-lowercase precondition is not met); the engine SHALL proceed to lookup-then-rerank, where the rerank's mixed-case identity rule returns the candidate `the`, and the engine produces the case-normalized suggestion `the`
+
+#### Scenario: Out-of-dictionary all-lowercase token proceeds to lookup
+- **WHEN** the user types `teh` (all-lowercase but not present in any of the three dictionaries)
+- **THEN** the early guard SHALL NOT fire; the engine SHALL invoke `SymSpell.lookup` and return the rerank's chosen correction (`the`)
+
+#### Scenario: Skipped event emitted with in_dictionary reason
+- **WHEN** the early guard fires for any in-dictionary all-lowercase token
+- **THEN** the engine SHALL emit `correction.skipped` with `reason: "in_dictionary"` so that telemetry aggregation can distinguish guard activations from `not_eligible` skips and from rerank-null skips
 

@@ -1,8 +1,5 @@
-# ngram-rerank Specification
+## MODIFIED Requirements
 
-## Purpose
-TBD - created by archiving change improve-autocorrect-context-and-segmentation. Update Purpose after archive.
-## Requirements
 ### Requirement: Multi-candidate rerank with stupid-backoff scoring
 The extension SHALL include an in-process n-gram rerank module (`src/ngram-rerank.ts`) that consumes a list of SymSpell candidate suggestions plus a `CorrectionContext` and returns a single best correction. All log-probabilities in the rerank scoring formula SHALL use base 10 (`Math.log10`), matching SymSpell's existing `wordSegmentation().probabilityLogSum` convention. Scoring SHALL be a weighted sum of unigram log-probability, bigram log-probability, trigram log-probability (when the trigram side-table is loaded), and an edit-distance penalty:
 
@@ -91,58 +88,3 @@ The rerank backoff α (`0.4`) is not exposed as a user config knob in v1; it is 
 #### Scenario: Identity suppression remains as defensive backstop for callers that bypass the engine guard
 - **WHEN** the rerank module is called directly (e.g., from a unit test or future caller) with an all-lowercase token whose candidate list contains an identity entry, AND the rerank's chosen winner equals the lowercased input
 - **THEN** the rerank SHALL still return a null winner per the rule above; the engine's early in-dictionary guard is the primary owner for the typical production flow, but the rerank rule remains in force defensively
-
-### Requirement: Trigram side-table loaded from a shipped data file
-The extension SHALL ship a trigram corpus at `data/trigram-top500k.tsv` containing the top 500,000 English trigrams by aggregated count, sourced from Google Books English n-grams (year ≥ 1990). The file format SHALL be tab-separated with one trigram per line: `w1<TAB>w2<TAB>w3<TAB>count<NEWLINE>`. Words SHALL be lowercase ASCII. The file SHALL be accompanied by `data/LICENSES.md` containing the CC-BY-SA 3.0 attribution required by the source. A one-shot build script `scripts/build-trigrams.ts` SHALL be committed to the repository to document and reproduce the extraction; the script SHALL NOT be invoked by `npm test`, `npm run build`, or CI.
-
-The trigram side-table SHALL also maintain bigram-prefix counts (a `Map` from `"w1\u0001w2"` to total count of trigrams beginning with that bigram prefix). These counts SHALL be derived at load time from the trigram TSV (sum over `w3` for each `(w1, w2)` pair) and SHALL be used as the denominator in the stupid-backoff trigram-tier scoring.
-
-#### Scenario: Trigram TSV file ships in the package
-- **WHEN** the extension package is installed
-- **THEN** the file `data/trigram-top500k.tsv` SHALL exist in the package directory and SHALL be readable
-
-#### Scenario: Trigram file is loaded into a Map keyed by w1<U+0001>w2<U+0001>w3
-- **WHEN** the trigram table loader runs
-- **THEN** it SHALL parse each TSV line into a Map entry whose key is `w1<U+0001>w2<U+0001>w3` (using the byte `0x01` as a separator that cannot appear in lowercase-ASCII words) and whose value is the integer count
-
-#### Scenario: Bigram-prefix counts are derived from the trigram table
-- **WHEN** the trigram table loader runs
-- **THEN** it SHALL also populate a Map from `w1<U+0001>w2` to the sum of counts across all trigrams beginning with that bigram prefix; this map SHALL be the denominator for stupid-backoff trigram-tier scoring
-
-#### Scenario: License attribution shipped alongside the data file
-- **WHEN** the extension package is installed
-- **THEN** the file `data/LICENSES.md` SHALL exist and SHALL include attribution text matching the CC-BY-SA 3.0 requirements for the Google Books n-gram source
-
-### Requirement: Trigram side-table lazy-attaches to the engine as a process-wide singleton
-The trigram side-table SHALL be loaded as a **process-wide singleton** — one shared `TrigramTable` instance per process, owned outside any individual engine. Engine instances SHALL acquire the singleton via `getTrigramTableSingleton(): Promise<TrigramTable | null>` which lazy-initializes on first call and returns the same promise to every subsequent caller. Multiple concurrent engines (during a `maxEditDistance`-rebuild orphan window) SHALL share the same in-flight load; rebuilds SHALL NOT trigger redundant TSV parses or duplicated resident memory.
-
-The singleton SHALL load asynchronously after the *first* engine reaches `ready` state. The engine SHALL NOT block its `ready` transition on trigram loading. While the trigram side-table is `null` (singleton not yet resolved), the rerank module's trigram tier SHALL be a **strict no-op**: the term `α₂ · logP(c | prevPrev, prev)` is skipped entirely from the weighted score (contribution is exactly `0`). When the trigram singleton resolves successfully, an atomic field assignment on the rerank module (`this.trigramTable = loadedTable`) SHALL make it visible to subsequent rerank calls. No UI event, status change, or notification SHALL fire on trigram attach success.
-
-The attach callback SHALL respect the engine's orphan-generation token (established by the prior `improve-autocorrect-quality-and-startup` change). When the singleton resolves, the engine's attach callback SHALL verify that the engine's owning generation still matches `state.generation` before assigning to the rerank module's trigram table field. On generation mismatch, the callback SHALL return silently (the orphan engine remains pre-attach and is no longer reachable from `state.engine`).
-
-If trigram loading fails (file missing, parse error, out-of-memory), the rerank SHALL continue to operate in bigram-only mode for the lifetime of every engine instance in the process. A single info-level log message SHALL be emitted (process-wide, not per-engine); no error notification SHALL appear in the TUI.
-
-#### Scenario: Engine reaches ready before trigrams load
-- **WHEN** `engine.initialize()` resolves (unigrams + bigrams loaded) but the trigram-singleton lazy-load promise is still in flight
-- **THEN** the engine's readiness state SHALL be `ready`; correction lookups SHALL be served; rerank SHALL operate with the trigram tier as a strict no-op (zero contribution), bigram and unigram tiers unaffected
-
-#### Scenario: Multiple engines share the singleton
-- **WHEN** the user runs `/typos config maxEditDistance` causing a rebuild while the trigram singleton's load promise is still in flight
-- **THEN** the orphan and replacement engines SHALL both await the same singleton promise; only one TSV parse SHALL occur in the process; only one `TrigramTable` instance SHALL exist in resident memory
-
-#### Scenario: Orphan engine attach callback no-ops on generation mismatch
-- **WHEN** the trigram singleton resolves AND the calling engine's owning generation no longer matches `state.generation` (it has been orphaned by a config-driven rebuild)
-- **THEN** the engine's attach callback SHALL verify the generation, detect the mismatch, and return silently without assigning to the rerank module's trigram table field
-
-#### Scenario: Trigrams attach silently after engine is ready
-- **WHEN** the trigram lazy-load promise resolves successfully
-- **THEN** subsequent rerank calls SHALL consult the trigram table; no `setStatus` call, no `notify` call, and no readiness-state change SHALL occur
-
-#### Scenario: Trigram load failure does not break the engine
-- **WHEN** the trigram lazy-load promise rejects (e.g., `data/trigram-top500k.tsv` not found, parse error)
-- **THEN** the engine SHALL remain in `ready` state, the rerank SHALL operate without the trigram tier for the engine's lifetime, and a single `console.info` (or equivalent low-severity log) message SHALL describe the failure; no error notification SHALL be shown in the TUI
-
-#### Scenario: Trigram load is non-blocking on cold start
-- **WHEN** the extension is freshly installed (no trigram cache yet) and the engine pre-warms at extension load with `defaultMode: "on"`
-- **THEN** the engine SHALL reach `ready` based on unigrams + bigrams alone; trigrams SHALL load in parallel without delaying the user's first available correction
-
