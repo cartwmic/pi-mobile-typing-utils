@@ -233,6 +233,15 @@ Each scenario follows the canonical `pi-tui-scenario-tests` pattern in condensed
 - **Mechanical assertions:** pane contains `Mobile autocorrect telemetry summary` (the heading locked in `src/telemetry-aggregate.ts`); pane contains `corrections applied:`.
 - **Coherence probe:** none (pre-submit).
 
+## Group H — In-dictionary guard regressions
+
+### T35 — In-dictionary guard prevents false-positive corrections
+- **Goal:** prove valid in-dictionary words (`they`, `makes`, `their`, `does`) are NOT silently rewritten to higher-frequency neighbors (`the`, `make`) by the rerank, while real typos (`teh`) and mixed-case identities (`tHe`) still get their expected corrections.
+- **Regression class:** the `guard-in-dictionary-tokens` change (archived 2026-04-28). Before that fix, the post-rerank identity-suppression rule fired only when the rerank's chosen winner equaled the identity; if a higher-frequency neighbor outscored the identity in `unigram + α₁·bigram + α₂·trigram − δ·ed`, the rewrite leaked through. Engine now short-circuits before `SymSpell.lookup()` whenever the lowercased token is in any of the three dictionaries (learned, tech, SymSpell unigrams).
+- **Steps:** start Pi, `/typos on`, type each of `they `, `makes `, `their `, `does ` (negative cases); then `teh ` (positive control: typo correction must still fire); then `tHe ` (positive control: mixed-case normalization must still fire — guard does not apply to mixed-case input).
+- **Mechanical assertions:** for each negative case, editor contains the input verbatim and does NOT contain the higher-frequency neighbor; for `teh`, editor contains `the` and not `teh`; for `tHe`, editor contains `the`.
+- **Coherence probe:** none (pre-submit).
+
 ## Running
 
 Run the full suite:
@@ -283,6 +292,7 @@ bash tests/scenarios/scripts/run-scenario-t01.sh
 | T32 | PENDING | Smoke-run deferred to user. |
 | T33 | PENDING | Smoke-run deferred to user. |
 | T34 | PENDING | Smoke-run deferred to user. |
+| T35 | PASS | All 6 sub-cases pass on real Pi TUI (verified 2026-04-28). Negative cases: `they`, `makes`, `their`, `does` preserved. Positive controls: `teh → the`, `tHe → the`. |
 
 ## Known issues / TODO (Phase 12 additions)
 

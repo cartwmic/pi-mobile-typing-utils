@@ -959,7 +959,7 @@ describe("Section 7 — Word-segmentation correction path (§7.7)", () => {
         probabilityLogSum: -8.0,
       });
 
-      const result = hthEngine.shouldCorrect("loco");
+      const result = hthEngine.shouldCorrect("locq"); // 'locq' not in dict → guard does not fire
       expect(result).toEqual({
         corrected: true,
         kind: "segmentation",
@@ -991,8 +991,8 @@ describe("Section 7 — Word-segmentation correction path (§7.7)", () => {
         probabilityLogSum: -8.0,
       });
 
-      // "loco" → lower = "loco"; winner.term = "local" ≠ "loco" → preserveCase("loco","local") = "local"
-      const result = hthEngine.shouldCorrect("loco");
+      // "locq" → lower = "locq" (not in any dict → guard does not fire); winner.term = "local" ≠ "locq" → preserveCase("locq","local") = "local"
+      const result = hthEngine.shouldCorrect("locq");
       expect(result).toEqual({ corrected: true, kind: "lookup", suggestion: "local" });
     });
 
@@ -1020,7 +1020,7 @@ describe("Section 7 — Word-segmentation correction path (§7.7)", () => {
       });
 
       // tie-breaker: lookup wins on equal finite scores
-      const result = hthEngine.shouldCorrect("loco");
+      const result = hthEngine.shouldCorrect("locq"); // 'locq' not in dict → guard does not fire
       expect(result).toEqual({ corrected: true, kind: "lookup", suggestion: "local" });
     });
 
@@ -1052,13 +1052,13 @@ describe("Section 7 — Word-segmentation correction path (§7.7)", () => {
       // Round 1: high bias → segmentation score = -8 + 5 = -3 > -9 → segmentation wins.
       hthBias = 5.0;
       stubBothPaths();
-      const r1 = hthEngine.shouldCorrect("loco");
+      const r1 = hthEngine.shouldCorrect("locq"); // 'locq' not in dict → guard does not fire
       expect(r1.corrected && r1.kind).toBe("segmentation");
 
       // Round 2: very negative bias → segmentation score = -8 + (-50) = -58 < -9 → lookup wins.
       hthBias = -50.0;
       stubBothPaths();
-      const r2 = hthEngine.shouldCorrect("loco");
+      const r2 = hthEngine.shouldCorrect("locq");
       expect(r2.corrected && r2.kind).toBe("lookup");
     });
   });
@@ -1248,4 +1248,160 @@ describe("Section 8 — Lazy trigram attach (§8.5)", () => {
 
     expect(attachSpy).not.toHaveBeenCalled();
   }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// correction-engine — early in-dictionary guard
+// ---------------------------------------------------------------------------
+describe("correction-engine — early in-dictionary guard", () => {
+  const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const bundledTechDictPath = resolve(projectRoot, "data/tech-dictionary.txt");
+
+  let guardLearnedWords: Set<string>;
+  let guardEngine: CorrectionEngine;
+
+  beforeAll(async () => {
+    guardLearnedWords = new Set<string>();
+    guardEngine = new CorrectionEngine({
+      techDictPath: bundledTechDictPath,
+      isLearned: (word) => guardLearnedWords.has(word),
+    });
+    await guardEngine.initialize();
+  });
+
+  beforeEach(() => {
+    guardLearnedWords.clear();
+    vi.restoreAllMocks();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // 2.2 — 'they' is in the SymSpell unigram dict; guard fires, lookup NOT called.
+  test("2.2 shouldCorrect('they') returns { corrected: false } and does not invoke symspell.lookup", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sym = (guardEngine as any).symspell;
+    const lookupSpy = vi.spyOn(sym, "lookup");
+
+    const result = guardEngine.shouldCorrect("they");
+    expect(result).toEqual({ corrected: false });
+    expect(lookupSpy).not.toHaveBeenCalled();
+  });
+
+  // 2.2 (with context) — realistic prior context must not defeat the guard.
+  test("2.2 shouldCorrect('they', { prev: 'and' }) still returns { corrected: false } with prior context", () => {
+    const result = guardEngine.shouldCorrect("they", { prev: "and" });
+    expect(result).toEqual({ corrected: false });
+  });
+
+  // 2.3 — 'makes' has a high-frequency neighbor 'make'; guard fires.
+  test("2.3 shouldCorrect('makes', { prev: 'she' }) returns { corrected: false }", () => {
+    const result = guardEngine.shouldCorrect("makes", { prev: "she" });
+    expect(result).toEqual({ corrected: false });
+  });
+
+  // 2.4 — Parameterized regression suite for high-frequency function words.
+  test.each(["their", "does", "where", "there"] as const)(
+    "2.4 shouldCorrect('%s') returns { corrected: false } (high-frequency function word)",
+    (word) => {
+      expect(guardEngine.shouldCorrect(word)).toEqual({ corrected: false });
+    },
+  );
+
+  // 2.5 — Learned word: guard fires via learned-dict layer; lookup NOT called.
+  test("2.5 learned word returns { corrected: false } without invoking lookup", () => {
+    guardLearnedWords.add("myproject");
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sym = (guardEngine as any).symspell;
+    const lookupSpy = vi.spyOn(sym, "lookup");
+
+    const result = guardEngine.shouldCorrect("myproject");
+    expect(result).toEqual({ corrected: false });
+    expect(lookupSpy).not.toHaveBeenCalled();
+  });
+
+  // 2.6 — Tech word: guard fires via tech-dict layer; lookup NOT called.
+  test("2.6 shouldCorrect('kubernetes') returns { corrected: false } without invoking lookup", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sym = (guardEngine as any).symspell;
+    const lookupSpy = vi.spyOn(sym, "lookup");
+
+    const result = guardEngine.shouldCorrect("kubernetes");
+    expect(result).toEqual({ corrected: false });
+    expect(lookupSpy).not.toHaveBeenCalled();
+  });
+
+  // 2.7 — Out-of-dictionary typo: guard does NOT fire; lookup runs; correction produced.
+  test("2.7 shouldCorrect('teh') still corrects to 'the' (guard does not fire for typos)", () => {
+    expect(guardEngine.shouldCorrect("teh")).toEqual({
+      corrected: true,
+      kind: "lookup",
+      suggestion: "the",
+    });
+  });
+
+  // 2.8 — Mixed-case in-dictionary token: guard must NOT fire (input is mixed-case).
+  test("2.8 shouldCorrect('tHe') still produces { corrected: true, suggestion: 'the' } (mixed-case path)", () => {
+    expect(guardEngine.shouldCorrect("tHe")).toEqual({
+      corrected: true,
+      kind: "lookup",
+      suggestion: "the",
+    });
+  });
+
+  // 2.9 — Mixed-case typo: guard does NOT fire; case-preservation pipeline intact.
+  test("2.9 shouldCorrect('Teh') produces { corrected: true, suggestion: 'The' } (case-preservation intact)", () => {
+    expect(guardEngine.shouldCorrect("Teh")).toEqual({
+      corrected: true,
+      kind: "lookup",
+      suggestion: "The",
+    });
+  });
+
+  // 2.10 — Telemetry: correction.skipped emitted with reason 'in_dictionary'.
+  test("2.10 correction.skipped event with reason 'in_dictionary' is emitted when guard fires", () => {
+    const emitted: unknown[] = [];
+    const engineWithTelemetry = new CorrectionEngine({
+      techDictPath: bundledTechDictPath,
+      isLearned: () => false,
+      telemetry: {
+        emit: (event) => emitted.push(event),
+        flush: () => Promise.resolve(),
+      },
+    });
+
+    // Bypass initialization by force-setting state (tests private access) —
+    // use guardEngine's already-built symspell and rerank to avoid an async load.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ge = engineWithTelemetry as any;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const src = guardEngine as any;
+    ge.symspell = src.symspell;
+    ge.techDict = src.techDict;
+    ge.rerank = src.rerank;
+    ge.readinessState = "ready";
+
+    engineWithTelemetry.shouldCorrect("they");
+
+    const skipped = emitted.filter(
+      (e): e is Record<string, unknown> =>
+        typeof e === "object" && e !== null && (e as Record<string, unknown>)["event"] === "correction.skipped",
+    );
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]!["reason"]).toBe("in_dictionary");
+  });
+
+  // 2.11 — Segmentation does NOT run for an in-dictionary token.
+  test("2.11 shouldCorrect('freelance') returns { corrected: false } without attempting segmentation", () => {
+    // 'freelance' is 9 chars (>= default segmentationMinLength 6) and is in the
+    // SymSpell unigram dict. The early guard fires before segmentation is reached.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const segSpy = vi.spyOn(guardEngine as any, "tryWordSegmentation");
+
+    const result = guardEngine.shouldCorrect("freelance");
+    expect(result).toEqual({ corrected: false });
+    expect(segSpy).not.toHaveBeenCalled();
+  });
 });

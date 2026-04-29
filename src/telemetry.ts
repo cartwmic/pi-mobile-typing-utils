@@ -187,6 +187,7 @@ export interface CorrectionSkippedEvent {
   tokenLength: number;
   reason:
     | "in_dict"
+    | "in_dictionary"
     | "not_eligible"
     | "no_candidates"
     | "low_confidence"

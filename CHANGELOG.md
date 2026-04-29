@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/) and this 
 
 ## [Unreleased]
 
+### Fixed
+
+- **In-dictionary words no longer rewritten to higher-frequency neighbors** (e.g., `they`, `makes`, `their`). Previously the post-rerank identity-suppression rule fired only when the rerank chose the identity term as winner; if a neighbor's unigram score exceeded the identity term's score by more than `rerankEditDistancePenalty`, the rewrite leaked through. The engine now short-circuits `shouldCorrect()` before `SymSpell.lookup()` whenever the lowercased input is present in any of the three dictionaries (learned, tech, SymSpell unigrams). A new `correction.skipped` event with `reason: "in_dictionary"` is emitted for observability.
+
 ### Added
 
 - **Word segmentation:** `/typos config enableSegmentation` (default `true`), `segmentationMinLength` (default `6`, range `[4, 12]`), `segmentationMaxEditDistance` (default `1`, range `[0, 2]`), `segmentationLogProbFloor` (default `-12.0`, range `[-30, 0]`), `segmentationVsLookupBias` (default `0.0`, range `[-10, 10]`) config keys. When enabled, accidentally-concatenated words (e.g. `thequick`) are detected and split into `the quick`. Split corrections include a `kind: "segmentation"` discriminator in the result and show a `(split)` label in the status flash. Segmentation runs against the SymSpell unigram dictionary only; tech-prose concatenations like `kubernetespod` are not split (documented known limitation).

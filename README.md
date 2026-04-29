@@ -106,7 +106,7 @@ View and manage telemetry summaries:
 
 ## How it works
 
-- **Three-layer dictionary lookup:** learned words first, bundled tech terms second, bundled SymSpell English last.
+- **Three-layer dictionary lookup:** learned words first, bundled tech terms second, bundled SymSpell English last. If the token is already in any of the three dictionaries (and is all-lowercase), the engine returns `{ corrected: false }` immediately without invoking SymSpell lookup. This guarantees a typed-and-known word is never silently rewritten, even when a higher-frequency neighbor (e.g., `they` vs `the`) would otherwise outscore it in the rerank.
 - **Token eligibility gate:** only tokens matching `^[A-Za-z]{3,}$` are considered for correction.
 - **Case preservation:** `Teh` becomes `The`, `TEH` becomes `THE`, and `teh` becomes `the`.
 - **Backspace-to-undo learning loop:** if you immediately backspace a correction, the original word is restored; repeated rejections teach the extension to keep that word in the future.

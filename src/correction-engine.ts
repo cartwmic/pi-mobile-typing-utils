@@ -344,6 +344,23 @@ export class CorrectionEngine {
     }
 
     const lower = token.toLowerCase();
+
+    // Early in-dictionary guard (autocorrect-engine spec §"Early in-dictionary guard").
+    // Short-circuits before SymSpell.lookup() when the lowercased token is already
+    // in any of the three dictionaries AND the input is all-lowercase.
+    if (token === lower && this.isInAnyDictionary(lower)) {
+      this.telemetry?.emit({
+        event: "correction.skipped",
+        timestamp: new Date().toISOString(),
+        tokenLength: token.length,
+        reason: "in_dictionary",
+        token: null,
+        lineText: null,
+        cursor: null,
+      });
+      return { corrected: false };
+    }
+
     const effectiveED = this.effectiveEditDistance(token.length);
 
     // 2. Lookup path: Verbosity.All + rerank
@@ -578,6 +595,21 @@ export class CorrectionEngine {
       },
       score,
     };
+  }
+
+  /**
+   * Returns true when `lower` (already lowercased) exists in any of the three
+   * dictionary layers: learned → tech → SymSpell unigrams.
+   *
+   * Used by the early in-dictionary guard in shouldCorrect().
+   */
+  private isInAnyDictionary(lower: string): boolean {
+    return (
+      this.isLearned(lower) ||
+      this.techDict.has(lower) ||
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (this.symspell as any).words.has(lower)
+    );
   }
 
   /**
